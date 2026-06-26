@@ -1,0 +1,20 @@
+version: "3.9"
+
+services:
+  entry-a-bot:
+    build: .
+    container_name: entry_a_bot
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./state:/app/state
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "5"
+    # Timezone sync from host
+    environment:
+      - TZ=UTC
