@@ -19,7 +19,7 @@ from src.broker.kraken import KrakenBroker
 # ── Page config ───────────────────────────────────────────────────────────────
 
 st.set_page_config(
-    page_title="Entry A Dashboard",
+    page_title="Entry_A_Algo Dashboard",
     layout="wide",
     initial_sidebar_state="expanded",
 )
