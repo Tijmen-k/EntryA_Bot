@@ -462,11 +462,14 @@ def main() -> None:
     bot = EntryABot(dry_run=args.dry_run or config.DRY_RUN)
 
     # Reconcile any open exchange positions on startup
-    positions = bot.broker.get_open_positions()
-    if positions:
-        logger.warning(f"Found {len(positions)} open position(s) on startup — will monitor them")
-    else:
-        logger.info("No open positions on exchange — clean start")
+    try:
+        positions = bot.broker.get_open_positions()
+        if positions:
+            logger.warning(f"Found {len(positions)} open position(s) on startup — will monitor them")
+        else:
+            logger.info("No open positions on exchange — clean start")
+    except Exception as exc:
+        logger.warning(f"Could not fetch open positions on startup: {exc} — continuing")
 
     bot.run()
 

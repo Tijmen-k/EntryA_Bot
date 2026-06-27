@@ -64,7 +64,7 @@ SESSIONS: list[SessionConfig] = [
 ]
 
 # Active weekdays: Tue=1, Wed=2, Thu=3 (Python: Mon=0…Sun=6)
-ACTIVE_WEEKDAYS: list[int] = [1, 2, 3]
+ACTIVE_WEEKDAYS: list[int] = [0, 1, 2, 3, 4, 5]
 
 # Cutoff: no new entries within this many minutes of session close
 NO_ENTRY_BEFORE_CLOSE_MINS: int = 60

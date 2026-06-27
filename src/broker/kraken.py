@@ -262,22 +262,25 @@ class KrakenBroker:
     def _get(self, endpoint: str) -> dict:
         url = f"{self._base}{self._path}{endpoint}"
         headers = self._auth_headers("GET", endpoint, "")
+        last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
                 r = self._session.get(url, headers=headers, timeout=config.REQUEST_TIMEOUT_S)
                 r.raise_for_status()
                 return r.json()
             except requests.exceptions.RequestException as exc:
+                last_exc = exc
                 logger.warning(f"GET {endpoint} attempt {attempt}: {exc}")
                 if attempt < config.MAX_RETRIES:
                     time.sleep(config.RETRY_DELAY_S * attempt)
-        return {}
+        raise last_exc
 
     def _post(self, endpoint: str, params: dict) -> dict:
         url = f"{self._base}{self._path}{endpoint}"
         body = urllib.parse.urlencode(params)
         headers = self._auth_headers("POST", endpoint, body)
         headers["Content-Type"] = "application/x-www-form-urlencoded"
+        last_exc: Exception = RuntimeError("no attempts made")
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
                 r = self._session.post(url, data=body, headers=headers,
@@ -285,20 +288,24 @@ class KrakenBroker:
                 r.raise_for_status()
                 return r.json()
             except requests.exceptions.RequestException as exc:
+                last_exc = exc
                 logger.warning(f"POST {endpoint} attempt {attempt}: {exc}")
                 if attempt < config.MAX_RETRIES:
                     time.sleep(config.RETRY_DELAY_S * attempt)
-        return {}
+        raise last_exc
 
     def _auth_headers(self, method: str, endpoint: str, post_data: str) -> dict:
         if not self._key or not self._secret:
             return {}
+        try:
+            secret_bytes = base64.b64decode(self._secret)
+        except Exception:
+            logger.error("KRAKEN_API_SECRET is not valid base64 — check your .env file")
+            return {}
         nonce = str(int(time.time() * 1000))
         full_endpoint = f"{self._path}{endpoint}"
-        # Signature: SHA256( postData + nonce + endpoint ) then HMAC-SHA512
         message = post_data + nonce + full_endpoint
         sha256 = hashlib.sha256(message.encode("utf-8")).digest()
-        secret_bytes = base64.b64decode(self._secret)
         sig = hmac.new(secret_bytes, sha256, hashlib.sha512).digest()
         authent = base64.b64encode(sig).decode("utf-8")
         return {
