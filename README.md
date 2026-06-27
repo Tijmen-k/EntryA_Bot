@@ -2,16 +2,6 @@
 
 Algorithmic implementation of the **Entry A** liquidity-sweep fade strategy on Kraken Futures (`PF_ETHUSD`).
 
-## Strategy summary
-
-- **Sessions:** London 09:00–14:00 UTC (ORB 09:00–09:30), NY 14:00–23:00 UTC (ORB 14:00–14:30)
-- **Active days:** Tuesday, Wednesday, Thursday only
-- **Signal:** Price sweeps outside the Opening Range, then closes back inside → enter fade trade
-- **Bias filter:** Only trade direction aligned with intraday bias (vs yesterday's open)
-- **SL:** 0.7% hard stop from entry
-- **TP:** Measured move — previous day's range projected from ORB boundary
-- **No entry:** final 60 min before session close
-
 ## Quick start
 
 ### 1. Clone & configure
@@ -85,7 +75,7 @@ entry-a-bot/
 
 ## VPS deployment checklist
 
-- [ ] Ubuntu 22.04 LTS VPS (1 CPU / 1 GB RAM is plenty)
+- [ ] VPS (1 CPU / 1 GB RAM is plenty)
 - [ ] Docker + Docker Compose installed
 - [ ] Port 22 open for SSH only
 - [ ] `.env` configured with correct API keys
@@ -93,10 +83,4 @@ entry-a-bot/
 - [ ] Run `--dry-run` for one full day to confirm logic fires correctly
 - [ ] Switch to `TRADING_MODE=live` only after demo validation passes
 
-## Risk warnings
 
-This software is provided for educational and research purposes. Trading futures carries significant risk of loss. Always:
-- Start on demo with `TRADING_MODE=demo`
-- Validate with `DRY_RUN=true` before enabling real orders
-- Use only capital you can afford to lose entirely
-- Monitor positions and logs daily
