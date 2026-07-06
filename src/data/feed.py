@@ -1,8 +1,9 @@
 """
-Kraken Futures public data feed.
-Fetches OHLCV candles via REST — no authentication needed for market data.
+Bitget Futures public data feed.
+Fetches OHLCV candles and ticker via REST — no authentication needed for market data.
 """
 import time
+import urllib.parse
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
@@ -23,15 +24,35 @@ class Bar:
     volume: float
 
 
-class KrakenFeed:
-    """Public REST client for OHLCV and ticker data."""
+# Bitget granularity strings
+_RESOLUTION_MAP = {
+    "1m":  "1m",
+    "3m":  "3m",
+    "5m":  "5m",
+    "15m": "15m",
+    "30m": "30m",
+    "1h":  "1H",
+    "2h":  "2H",
+    "4h":  "4H",
+    "6h":  "6H",
+    "12h": "12H",
+    "1d":  "1D",
+    "1w":  "1W",
+}
+
+_REST_PREFIX = "/api/v2/mix"
+
+
+class BitgetFeed:
+    """Public REST client for Bitget USDT-M Futures OHLCV and ticker data."""
 
     def __init__(self) -> None:
-        self._base = config.KRAKEN_BASE_URL
-        self._chart_path = config.KRAKEN_CHART_PATH
-        self._tick = config.CHART_TICK_TYPE
+        self._base    = config.BITGET_BASE_URL
         self._session = requests.Session()
-        self._session.headers.update({"Accept": "application/json"})
+        self._session.headers.update({
+            "Accept":  "application/json",
+            "locale":  "en-US",
+        })
 
     # ──────────────────────────────────────────
     # Public interface
@@ -45,84 +66,96 @@ class KrakenFeed:
         from_ts: Optional[int] = None,
         to_ts: Optional[int] = None,
     ) -> list[Bar]:
-        """Return up to `count` closed 1-min bars, newest last."""
-        url = f"{self._base}{self._chart_path}/{self._tick}/{symbol}/{resolution}"
-        params: dict = {}
+        """Return up to `count` bars sorted oldest → newest."""
+        granularity = _RESOLUTION_MAP.get(resolution.lower(), resolution)
+        params: dict = {
+            "symbol":      symbol,
+            "productType": config.PRODUCT_TYPE,
+            "granularity": granularity,
+            "limit":       str(min(count, 1000)),
+        }
         if from_ts:
-            params["from"] = from_ts
+            params["startTime"] = str(from_ts)
         if to_ts:
-            params["to"] = to_ts
-        if not from_ts and not to_ts:
-            params["count"] = count
+            params["endTime"] = str(to_ts)
 
-        data = self._get(url, params)
-        if not data:
-            return []
-
-        candles_raw = data.get("candles") or data.get("result", {})
-        if isinstance(candles_raw, dict):
-            candles_raw = candles_raw.get("candles", [])
-        if not candles_raw:
-            logger.warning(f"Empty candles in response for {symbol}")
+        data = self._get("/market/candles", params)
+        raw = data.get("data") or []
+        if not raw:
+            logger.warning(f"Empty candles response for {symbol}")
             return []
 
         bars: list[Bar] = []
-        for c in candles_raw:
-            if isinstance(c, (list, tuple)):
-                ts_ms, o, h, l, cl, vol = c[0], c[1], c[2], c[3], c[4], c[5]
-            else:
-                ts_ms = c.get("time") or c.get("timestamp")
-                o  = c.get("open",   c.get("o"))
-                h  = c.get("high",   c.get("h"))
-                l  = c.get("low",    c.get("l"))
-                cl = c.get("close",  c.get("c"))
-                vol = c.get("volume", c.get("v", 0))
-
-            bars.append(Bar(
-                timestamp=datetime.fromtimestamp(int(ts_ms) / 1000, tz=timezone.utc),
-                open=float(o),
-                high=float(h),
-                low=float(l),
-                close=float(cl),
-                volume=float(vol),
-            ))
+        for c in raw:
+            try:
+                ts_ms = int(c[0])
+                bars.append(Bar(
+                    timestamp=datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc),
+                    open=float(c[1]),
+                    high=float(c[2]),
+                    low=float(c[3]),
+                    close=float(c[4]),
+                    volume=float(c[5]),
+                ))
+            except (IndexError, ValueError, TypeError) as exc:
+                logger.debug(f"Skipping malformed candle entry: {c} ({exc})")
 
         bars.sort(key=lambda b: b.timestamp)
         return bars
 
     def get_current_price(self, symbol: str) -> Optional[float]:
-        """Best-bid/ask mid price from the ticker endpoint."""
-        url = f"{self._base}{config.KRAKEN_REST_PATH}/tickers/{symbol}"
-        data = self._get(url, {})
-        if not data:
-            return None
-        ticker = data.get("ticker") or {}
-        bid = ticker.get("bid") or ticker.get("bestBid")
-        ask = ticker.get("ask") or ticker.get("bestAsk")
-        last = ticker.get("last") or ticker.get("markPrice")
+        """Return mid price from the best bid/ask, falling back to last price."""
+        params = {
+            "symbol":      symbol,
+            "productType": config.PRODUCT_TYPE,
+        }
+        data = self._get("/market/ticker", params)
+        ticker = data.get("data") or {}
+        # Bitget may return a list (all tickers) or a single dict
+        if isinstance(ticker, list):
+            ticker = next((t for t in ticker if t.get("symbol") == symbol), {})
+        bid  = _maybe_float(ticker.get("bidPr")  or ticker.get("bestBid"))
+        ask  = _maybe_float(ticker.get("askPr")  or ticker.get("bestAsk"))
+        last = _maybe_float(ticker.get("lastPr") or ticker.get("last") or ticker.get("markPrice"))
         if bid and ask:
-            return (float(bid) + float(ask)) / 2
-        if last:
-            return float(last)
-        return None
+            return (bid + ask) / 2
+        return last
 
     # ──────────────────────────────────────────
     # Internal
     # ──────────────────────────────────────────
 
-    def _get(self, url: str, params: dict) -> dict:
+    def _get(self, path: str, params: dict) -> dict:
+        qs = urllib.parse.urlencode(params)
+        url = f"{self._base}{_REST_PREFIX}{path}?{qs}"
         for attempt in range(1, config.MAX_RETRIES + 1):
             try:
-                r = self._session.get(url, params=params, timeout=config.REQUEST_TIMEOUT_S)
-                r.raise_for_status()
-                data = r.json()
-                if data.get("result") not in ("success", None) and "error" in data:
-                    logger.error(f"API error from {url}: {data}")
+                r = self._session.get(url, timeout=config.REQUEST_TIMEOUT_S)
+                if not r.ok:
+                    # Log the full Bitget error body so we can see the exact error code/msg
+                    logger.error(f"GET {path} HTTP {r.status_code}: {r.text}")
+                    if 400 <= r.status_code < 500:
+                        return {}  # client error — don't retry
+                    r.raise_for_status()
+                resp = r.json()
+                if resp.get("code") != "00000":
+                    logger.error(f"Bitget API error GET {path}: {resp}")
                     return {}
-                return data
+                return resp
             except requests.exceptions.RequestException as exc:
-                logger.warning(f"GET {url} attempt {attempt} failed: {exc}")
+                logger.warning(f"GET {path} attempt {attempt}: {exc}")
                 if attempt < config.MAX_RETRIES:
                     time.sleep(config.RETRY_DELAY_S * attempt)
-        logger.error(f"All retries exhausted for GET {url}")
+        logger.error(f"All retries exhausted for GET {path}")
         return {}
+
+
+def _maybe_float(v) -> Optional[float]:
+    try:
+        return float(v) if v is not None and v != "" else None
+    except (TypeError, ValueError):
+        return None
+
+
+# ── Backward-compatible alias ──
+KrakenFeed = BitgetFeed

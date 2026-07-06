@@ -1,6 +1,7 @@
 """
 Central configuration — all values loaded from .env or environment variables.
 Live vs demo is controlled by TRADING_MODE=live|demo.
+Bitget uses the same API base URL for both; demo is account-level (paper trading).
 """
 import os
 from dataclasses import dataclass, field
@@ -10,27 +11,39 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # ──────────────────────────────────────────────
-# Kraken Futures API
+# Bitget Futures API
 # ──────────────────────────────────────────────
 TRADING_MODE: str = os.getenv("TRADING_MODE", "demo")  # "demo" | "live"
 
-KRAKEN_API_KEY: str = os.getenv("KRAKEN_API_KEY", "")
-KRAKEN_API_SECRET: str = os.getenv("KRAKEN_API_SECRET", "")
+BITGET_API_KEY: str        = os.getenv("BITGET_API_KEY", "")
+BITGET_API_SECRET: str     = os.getenv("BITGET_API_SECRET", "")
+BITGET_API_PASSPHRASE: str = os.getenv("BITGET_API_PASSPHRASE", "")
 
-KRAKEN_BASE_URL: str = (
-    "https://demo-futures.kraken.com"
-    if TRADING_MODE == "demo"
-    else "https://futures.kraken.com"
-)
-KRAKEN_REST_PATH: str = "/derivatives/api/v3"
-KRAKEN_CHART_PATH: str = "/api/charts/v1"
+BITGET_BASE_URL: str = "https://api.bitget.com"  # same endpoint for demo & live
 
 # ──────────────────────────────────────────────
 # Instrument
 # ──────────────────────────────────────────────
-SYMBOL: str = os.getenv("SYMBOL", "PF_ETHUSD")          # Linear perpetual
-CHART_TICK_TYPE: str = "trade"                           # "trade" | "mark"
-RESOLUTION: str = "1m"
+SYMBOL: str        = os.getenv("SYMBOL", "BTCUSDT")   # USDT-M linear perpetual
+PRODUCT_TYPE: str  = "USDT-FUTURES"
+MARGIN_COIN: str   = "USDT"
+MARGIN_MODE: str   = os.getenv("MARGIN_MODE", "isolated")  # "crossed" | "isolated"
+CONTRACT_SIZE: float   = float(os.getenv("CONTRACT_SIZE", "0.001"))   # BTC per contract for BTCUSDT
+PRICE_PRECISION: int   = int(os.getenv("PRICE_PRECISION", "1"))       # decimal places for BTCUSDT prices (tick = 0.1)
+
+CHART_TICK_TYPE: str = "trade"
+RESOLUTION: str      = "1m"
+
+# ──────────────────────────────────────────────
+# Strategy parameters (per-session, env-overrideable)
+# ──────────────────────────────────────────────
+LONDON_SL_PCT: float      = float(os.getenv("LONDON_SL_PCT",      "0.0075"))
+NY_SL_PCT: float          = float(os.getenv("NY_SL_PCT",          "0.0085"))
+
+# Fixed USDT position size for the algo (0 = use RISK_PER_TRADE_PCT instead)
+ALGO_POSITION_USDT: float = float(os.getenv("ALGO_POSITION_USDT", "300.0"))
+
+LIMIT_ENTRY_BUFFER_PCT: float = float(os.getenv("LIMIT_ENTRY_BUFFER_PCT", "0.0003"))
 
 # ──────────────────────────────────────────────
 # Sessions (all times in UTC)
@@ -40,7 +53,7 @@ class SessionConfig:
     name: str
     orb_start_h: int      # ORB window opens (hour)
     orb_start_m: int      # ORB window opens (minute)
-    orb_end_h: int        # ORB window closes (30 min later)
+    orb_end_h: int        # ORB window closes
     orb_end_m: int
     session_close_h: int  # session hard close
     session_close_m: int
@@ -49,22 +62,26 @@ class SessionConfig:
 SESSIONS: list[SessionConfig] = [
     SessionConfig(
         name="London",
-        orb_start_h=9,  orb_start_m=0,
-        orb_end_h=9,    orb_end_m=30,
-        session_close_h=14, session_close_m=0,
-        sl_pct=0.007,
+        orb_start_h=int(os.getenv("LONDON_ORB_START_H", "9")),
+        orb_start_m=int(os.getenv("LONDON_ORB_START_M", "0")),
+        orb_end_h=  int(os.getenv("LONDON_ORB_END_H",   "9")),
+        orb_end_m=  int(os.getenv("LONDON_ORB_END_M",   "30")),
+        session_close_h=12, session_close_m=0,
+        sl_pct=LONDON_SL_PCT,
     ),
     SessionConfig(
         name="NY",
-        orb_start_h=14, orb_start_m=0,
-        orb_end_h=14,   orb_end_m=30,
+        orb_start_h=int(os.getenv("NY_ORB_START_H", "12")),
+        orb_start_m=int(os.getenv("NY_ORB_START_M", "0")),
+        orb_end_h=  int(os.getenv("NY_ORB_END_H",   "12")),
+        orb_end_m=  int(os.getenv("NY_ORB_END_M",   "30")),
         session_close_h=23, session_close_m=0,
-        sl_pct=0.007,
+        sl_pct=NY_SL_PCT,
     ),
 ]
 
-# Active weekdays: Tue=1, Wed=2, Thu=3 (Python: Mon=0…Sun=6)
-ACTIVE_WEEKDAYS: list[int] = [0, 1, 2, 3, 4, 5]
+# Active weekdays: Mon=0…Sun=6
+ACTIVE_WEEKDAYS: list[int] = [0, 1, 2, 3, 4]
 
 # Cutoff: no new entries within this many minutes of session close
 NO_ENTRY_BEFORE_CLOSE_MINS: int = 60
@@ -72,30 +89,37 @@ NO_ENTRY_BEFORE_CLOSE_MINS: int = 60
 # ──────────────────────────────────────────────
 # Strategy parameters
 # ──────────────────────────────────────────────
-ORB_HIGH_BUFFER_PCT: float = 0.0001    # 0.01% buffer on ORB boundary
+ORB_HIGH_BUFFER_PCT: float = 0.0001
 ORB_LOW_BUFFER_PCT: float  = 0.0001
-INVALIDATION_PCT: float    = 0.003    # 0.3% — abandon signal if exceeded
-ENTRY_BUFFER_PCT: float    = 0.0001   # 0.01% beyond ORB for entry
-SLIPPAGE_PCT: float        = 0.0001   # 0.01% simulated slippage
+INVALIDATION_PCT: float    = 0.003
 
 # ──────────────────────────────────────────────
 # Risk management
 # ──────────────────────────────────────────────
-RISK_PER_TRADE_PCT: float  = float(os.getenv("RISK_PER_TRADE_PCT", "0.01"))  # 1% of account
-LEVERAGE: float            = float(os.getenv("LEVERAGE", "5.0"))              # 5x default live
-MAX_DAILY_LOSS_PCT: float  = 0.03   # 3% — halt trading if exceeded today
-MAX_WEEKLY_LOSS_PCT: float = 0.06   # 6%
-COMMISSION_PCT: float      = 0.0002  # 0.02% per side (Kraken maker)
+RISK_PER_TRADE_PCT: float  = float(os.getenv("RISK_PER_TRADE_PCT", "0.001"))
+LEVERAGE: float            = float(os.getenv("LEVERAGE", "50"))
+MAX_DAILY_LOSS_PCT: float  = 0.03
+MAX_WEEKLY_LOSS_PCT: float = 0.06
+COMMISSION_PCT: float      = 0.0002  # ~0.02% maker fee on Bitget futures
 
 # ──────────────────────────────────────────────
 # Operational
 # ──────────────────────────────────────────────
-DRY_RUN: bool = os.getenv("DRY_RUN", "false").lower() == "true"
+DRY_RUN: bool  = os.getenv("DRY_RUN", "false").lower() == "true"
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 STATE_FILE: str = "state/state.json"
-LOG_DIR: str = "logs"
+LOG_DIR: str    = "logs"
 
 # Retry / network
-REQUEST_TIMEOUT_S: int = 10
-MAX_RETRIES: int = 3
-RETRY_DELAY_S: float = 2.0
+REQUEST_TIMEOUT_S: int  = 10
+MAX_RETRIES: int        = 3
+RETRY_DELAY_S: float    = 2.0
+
+# ──────────────────────────────────────────────
+# Discord notifications
+# ──────────────────────────────────────────────
+# Paste your Discord channel webhook URL here (or in .env).
+# Leave blank to disable all Discord notifications.
+DISCORD_WEBHOOK_URL: str           = os.getenv("DISCORD_WEBHOOK_URL", "")
+# How often to send a heartbeat ping (minutes). 0 = disabled.
+DISCORD_HEARTBEAT_INTERVAL_MINS: int = int(os.getenv("DISCORD_HEARTBEAT_INTERVAL_MINS", "60"))

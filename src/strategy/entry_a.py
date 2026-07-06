@@ -5,13 +5,22 @@ State machine per session:
   WAITING_FOR_ORB       → build the Opening Range from first 30 minutes
   WAITING_FOR_BREAKOUT  → wait for price to sweep outside ORB
   WAITING_FOR_CONFIRM   → wait for close back inside ORB (false breakout confirmed)
+  PENDING_ENTRY         → resting limit order placed, waiting for it to fill or invalidate
   TRADE_OPEN            → position is live; monitor SL/TP
-  DONE                  → session finished (trade closed or invalidated)
+  DONE                  → session finished (trade closed, invalidated, or cancelled)
 
 Bias (direction filter):
-  London: bearish if today's 09:00 close < yesterday's open
-  NY    : bearish if today's 14:00 close < today's 09:00 close
+  London: bearish if price at London's ORB start < yesterday's open
+  NY    : bearish if price at NY's ORB start < price at London's ORB start
+  Both reference points follow each session's configured orb_start_h/m.
   Only trades aligned with session bias are taken.
+
+Entry is a LIMIT order, not a market fill: once the confirming candle closes
+back inside the ORB, a limit order is placed slightly beyond that close
+(above it for a long/bullish setup, below it for a short/bearish setup),
+rather than entering immediately at the close price. Whether it actually
+fills is decided by the exchange, not this module — main.py polls the broker
+and calls back in once a fill (or cancellation) happens.
 """
 import json
 from dataclasses import dataclass, field, asdict
@@ -32,9 +41,10 @@ from src.data.feed import Bar
 # ──────────────────────────────────────────────────────
 
 class SessionPhase(Enum):
-    WAITING_FOR_ORB     = auto()
+    WAITING_FOR_ORB      = auto()
     WAITING_FOR_BREAKOUT = auto()
     WAITING_FOR_CONFIRM  = auto()
+    PENDING_ENTRY        = auto()
     TRADE_OPEN           = auto()
     DONE                 = auto()
 
@@ -48,10 +58,14 @@ class ORBRange:
 
 @dataclass
 class TradeSignal:
-    """Emitted when Entry A fires and a trade should be placed."""
+    """
+    Emitted when Entry A confirms a false breakout and a limit order should
+    be placed. `entry_price` is the intended LIMIT price (slightly beyond the
+    confirming candle's close), not a guaranteed fill.
+    """
     session: str
     direction: str          # "long" | "short"
-    entry_price: float
+    entry_price: float      # limit order price
     sl_price: float
     tp_price: float
     orb_high: float
@@ -61,7 +75,7 @@ class TradeSignal:
 
 @dataclass
 class OpenTrade:
-    """Tracks the live trade state (persisted to state.json)."""
+    """Tracks the live trade state (persisted to state.json), after the limit entry fills."""
     signal: dict            # TradeSignal as dict for serialisation
     contracts: float
     entry_order_id: Optional[str] = None
@@ -88,7 +102,8 @@ class SessionStateMachine:
         self.bias_is_bearish: Optional[bool] = None
         self.breakout_level: Optional[float] = None
         self.sweep_extreme: Optional[float] = None
-        self.signal: Optional[TradeSignal] = None
+        self.pending_signal: Optional[TradeSignal] = None  # limit order resting, not yet filled
+        self.signal: Optional[TradeSignal] = None          # signal for the trade that actually opened
 
     # ── time helpers ────────────────────────────────
 
@@ -121,9 +136,11 @@ class SessionStateMachine:
     def on_bar(self, bar: Bar) -> Optional[TradeSignal]:
         """
         Process a closed 1-minute bar.
-        Returns a TradeSignal when entry conditions are met, else None.
+        Returns a TradeSignal (a limit order to place) when entry conditions
+        are met, else None. PENDING_ENTRY / TRADE_OPEN lifecycle (fill
+        detection, SL/TP monitoring) is handled by main.py, not here.
         """
-        if self.phase == SessionPhase.DONE:
+        if self.phase in (SessionPhase.DONE, SessionPhase.PENDING_ENTRY, SessionPhase.TRADE_OPEN):
             return None
 
         now = bar.timestamp
@@ -190,10 +207,15 @@ class SessionStateMachine:
 
     # ── breakout detection ──────────────────────────
 
-    def _check_breakout(self, bar: Bar) -> None:
+    def _check_breakout(self, bar: Bar) -> Optional[TradeSignal]:
         """
         If bearish bias: look for price sweeping ABOVE ORB high (liquidity grab above).
         If bullish bias: look for price sweeping BELOW ORB low  (liquidity grab below).
+
+        A wick through the boundary is enough to qualify as a sweep — the bar does NOT
+        need to close outside.  After detecting the sweep we immediately run the
+        confirmation check on the same bar, so a single candle that wicks outside and
+        closes back inside fires the entry without waiting for the next bar.
         """
         if self.bias_is_bearish:
             # Bullish sweep above ORB high → fade SHORT
@@ -202,6 +224,7 @@ class SessionStateMachine:
                 self.sweep_extreme  = bar.high
                 self._goto(SessionPhase.WAITING_FOR_CONFIRM,
                            f"sweep above ORB H={self.orb.high:.4f} bar_high={bar.high:.4f}")
+                return self._check_confirmation(bar)
         else:
             # Bearish sweep below ORB low → fade LONG
             if bar.low < self.orb.low:
@@ -209,6 +232,7 @@ class SessionStateMachine:
                 self.sweep_extreme  = bar.low
                 self._goto(SessionPhase.WAITING_FOR_CONFIRM,
                            f"sweep below ORB L={self.orb.low:.4f} bar_low={bar.low:.4f}")
+                return self._check_confirmation(bar)
         return None
 
     # ── confirmation detection ──────────────────────
@@ -217,6 +241,8 @@ class SessionStateMachine:
         """
         Wait for price to close back inside the ORB boundary.
         Also check for invalidation (price extends 0.3% further opposite direction).
+        On confirmation, build a LIMIT entry slightly beyond the confirming
+        candle's close (not a market fill) and move to PENDING_ENTRY.
         """
         is_bearish = self.bias_is_bearish
         level = self.breakout_level
@@ -243,11 +269,19 @@ class SessionStateMachine:
         if not confirmed:
             return None
 
-        # Build the signal
-        direction  = "short" if is_bearish else "long"
-        entry      = self._calc_entry(level, direction)
-        sl         = self._calc_sl(entry, direction)
-        tp         = self._calc_tp(entry, direction)
+        direction = "short" if is_bearish else "long"
+
+        # LIMIT entry, placed slightly beyond the confirming candle's close:
+        # long (bullish bias)  -> limit ABOVE close
+        # short (bearish bias) -> limit BELOW close
+        buffer_pct = config.LIMIT_ENTRY_BUFFER_PCT
+        if direction == "long":
+            limit_price = bar.close * (1.0 + buffer_pct)
+        else:
+            limit_price = bar.close * (1.0 - buffer_pct)
+
+        sl = self._calc_sl(limit_price, direction)
+        tp = self._calc_tp(limit_price, direction)
 
         if tp is None:
             self._goto(SessionPhase.DONE, "could not calculate TP (prev-day range too small)")
@@ -256,7 +290,7 @@ class SessionStateMachine:
         signal = TradeSignal(
             session=self.cfg.name,
             direction=direction,
-            entry_price=entry,
+            entry_price=limit_price,
             sl_price=sl,
             tp_price=tp,
             orb_high=self.orb.high,
@@ -264,19 +298,42 @@ class SessionStateMachine:
             breakout_level=level,
         )
 
-        self._goto(SessionPhase.TRADE_OPEN, f"SIGNAL confirmed → {direction} entry={entry:.4f} sl={sl:.4f} tp={tp:.4f}")
-        self.signal = signal
+        self.pending_signal = signal
+        self._goto(SessionPhase.PENDING_ENTRY,
+                   f"confirmed → LIMIT {direction} @ {limit_price:.4f} sl={sl:.4f} tp={tp:.4f}")
         return signal
 
-    # ── price calculations ──────────────────────────
+    # ── pending-entry lifecycle (limit order resting, not yet filled) ──
 
-    def _calc_entry(self, level: float, direction: str) -> float:
-        buf = config.ENTRY_BUFFER_PCT
-        slip = config.SLIPPAGE_PCT
-        if direction == "short":
-            return level * (1.0 - buf) - level * slip
+    def check_pending_invalidation(self, bar: Bar) -> Optional[str]:
+        """
+        While a limit entry is resting, decide whether it should be cancelled:
+        price extends 0.3% further away (same rule as post-confirmation
+        invalidation), or the entry cutoff / session close has arrived.
+        Returns a reason string if it should be cancelled, else None.
+        Pure price/time logic only — main.py is responsible for actually
+        cancelling the exchange order and detecting fills.
+        """
+        if self.pending_signal is None:
+            return None
+        if bar.timestamp >= self._entry_cutoff():
+            return "entry cutoff reached before fill"
+        if self.bias_is_bearish:
+            inv_level = self.orb.low * (1.0 - config.INVALIDATION_PCT)
+            if bar.low < inv_level:
+                return f"price extended below ORB low to {bar.low:.4f} before fill"
         else:
-            return level * (1.0 + buf) + level * slip
+            inv_level = self.orb.high * (1.0 + config.INVALIDATION_PCT)
+            if bar.high > inv_level:
+                return f"price extended above ORB high to {bar.high:.4f} before fill"
+        return None
+
+    def cancel_pending_entry(self, reason: str) -> None:
+        logger.info(f"[{self.cfg.name}] Cancelling pending limit entry: {reason}")
+        self.pending_signal = None
+        self._goto(SessionPhase.DONE, f"pending entry cancelled: {reason}")
+
+    # ── price calculations ──────────────────────────
 
     def _calc_sl(self, entry: float, direction: str) -> float:
         sl_pct = self.cfg.sl_pct
@@ -339,11 +396,11 @@ class BiasCalculator:
     Determines intraday directional bias from daily bars or intraday reference prices.
 
     London bias:
-      is_bearish = price_at_09:00_UTC < yesterday_open
+      is_bearish = price_at_London_ORB_start < yesterday_open
     NY bias:
-      is_bearish = price_at_14:00_UTC < price_at_09:00_UTC
+      is_bearish = price_at_NY_ORB_start < price_at_London_ORB_start
 
-    Overall: is_bearish = (today_close < yesterday_open)
+    Both reference points follow each session's configured orb_start_h/m.
     """
 
     @staticmethod
