@@ -73,6 +73,8 @@ class BotState:
         "yesterday_open": None,
         "prev_day_high": None,
         "prev_day_low": None,
+        "london_range_pct": None,   # measured-move % for TP: prev-day-start → London open
+        "ny_range_pct":     None,   # measured-move % for TP: prev-day-start → NY open
         # ORB / session-phase tracking (for dashboard)
         "london_phase":           "WAITING_FOR_ORB",
         "london_orb_high":        None,
@@ -333,9 +335,9 @@ class EntryABot:
             bias = resolve_bias(getattr(self.state, f"{key}_bias_bearish"), getattr(self.state, f"{key}_bias_override"))
             if bias is not None:
                 sm.set_bias(bias)
-                if self.state.prev_day_high and self.state.prev_day_low:
-                    pdr = self.bias.compute_prev_day_range_pct(self.state.prev_day_high, self.state.prev_day_low)
-                    sm.set_prev_day_range_pct(pdr)
+                range_pct = getattr(self.state, f"{key}_range_pct")
+                if range_pct is not None:
+                    sm.set_prev_day_range_pct(range_pct)
                 setattr(self, f"_applied_{key}_bias", bias)
 
             orb_start = datetime.combine(today, dtime(cfg.orb_start_h, cfg.orb_start_m), tzinfo=timezone.utc)
@@ -429,6 +431,7 @@ class EntryABot:
                     )
                     self.state.set(london_bias_bearish=is_bearish)
                     self.notifier.bias_set("London", is_bearish, ref_09.close, self.state.yesterday_open)
+                self._capture_range_pct("london", _lon, today)
 
         # Price at NY session open (bias endpoint 2)
         _ny = config.SESSIONS[1]
@@ -447,6 +450,7 @@ class EntryABot:
                     )
                     self.state.set(ny_bias_bearish=is_bearish)
                     self.notifier.bias_set("NY", is_bearish, ref_14.close, self.state.price_at_09)
+                self._capture_range_pct("ny", _ny, today)
 
     @staticmethod
     def _find_bar_at(bars: list[Bar], date, hour: int, minute: int) -> Optional[Bar]:
@@ -454,6 +458,32 @@ class EntryABot:
             if b.timestamp.date() == date and b.timestamp.hour == hour and b.timestamp.minute == minute:
                 return b
         return None
+
+    def _capture_range_pct(self, key: str, cfg, today) -> None:
+        """
+        TP measured-move %: highest high / lowest low across ALL price action
+        from the previous calendar day's 00:00 UTC through this session's own
+        ORB-open moment (today) — not just yesterday's single daily candle.
+        Fires once per session per day, same as the bias/reference captures above.
+        """
+        if getattr(self.state, f"{key}_range_pct") is not None:
+            return
+        window_end   = datetime.combine(today, dtime(cfg.orb_start_h, cfg.orb_start_m), tzinfo=timezone.utc)
+        window_start = datetime.combine(today - timedelta(days=1), dtime.min, tzinfo=timezone.utc)
+        try:
+            lookback_bars = self.feed.fetch_ohlcv(config.SYMBOL, "1h", count=48)
+        except Exception as exc:
+            logger.warning(f"[{cfg.name}] Could not fetch lookback bars for measured-move range: {exc}")
+            return
+        pct = self.bias.compute_measured_move_pct(lookback_bars, window_start, window_end)
+        if pct is None:
+            logger.warning(f"[{cfg.name}] No bars in measured-move lookback window — TP will be unavailable until captured")
+            return
+        self.state.set(**{f"{key}_range_pct": pct})
+        logger.info(
+            f"[{cfg.name}] Measured-move range captured: "
+            f"{window_start.date()} 00:00 UTC → {window_end.strftime('%H:%M UTC')} = {pct*100:.3f}%"
+        )
 
     # ──────────────────────────────────────────
     # Session routing
@@ -479,13 +509,15 @@ class EntryABot:
                 self._process_sm(self._ny_sm, bar)
 
     def _apply_bias(self, sm: SessionStateMachine, key: str, bias: bool, previously_applied: Optional[bool]) -> None:
-        """Push the effective bias to the session SM, and (re)compute prev-day-range if needed —
-        required so a manual override still gets a usable TP even before the natural ORB-start capture."""
+        """Push the effective bias to the session SM, and (re)apply the measured-move TP
+        range if needed — required so a manual override still gets a usable TP even
+        before the natural ORB-start capture."""
         if bias != previously_applied:
             sm.set_bias(bias)
-        if getattr(sm, "prev_day_range_pct", None) is None and self.state.prev_day_high and self.state.prev_day_low:
-            pdr = self.bias.compute_prev_day_range_pct(self.state.prev_day_high, self.state.prev_day_low)
-            sm.set_prev_day_range_pct(pdr)
+        if getattr(sm, "prev_day_range_pct", None) is None:
+            range_pct = getattr(self.state, f"{key}_range_pct")
+            if range_pct is not None:
+                sm.set_prev_day_range_pct(range_pct)
 
     def _process_sm(self, sm: SessionStateMachine, bar: Bar) -> None:
         signal = sm.on_bar(bar)
@@ -611,15 +643,20 @@ class EntryABot:
         direction  = sig["direction"]
         contracts  = pe["contracts"]
         entry_price = filled_pos.entry_price or sig["entry_price"]
-        exit_side  = "buy" if direction == "short" else "sell"
+        # Bitget's hedge-mode `side` for SL/TP plan orders must match the
+        # POSITION's direction (buy=long, sell=short) — same value used for
+        # the entry order — not the literal action needed to close it.
+        # Sending the flipped action side (the old bug) makes Bitget label a
+        # short's bracket orders as "Close Long".
+        bracket_side = "sell" if direction == "short" else "buy"
 
         sl_id = self.broker.place_stop_market_order(
-            side=exit_side, size=contracts,
+            side=bracket_side, size=contracts,
             stop_price=sig["sl_price"],
             client_id=f"sl_{sig['session']}",
         )
         tp_id = self.broker.place_take_profit_order(
-            side=exit_side, size=contracts,
+            side=bracket_side, size=contracts,
             limit_price=sig["tp_price"],
             client_id=f"tp_{sig['session']}",
         )

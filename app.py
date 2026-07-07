@@ -438,6 +438,7 @@ if _mt:
         st.session_state.manual_trade = None
 
 open_trade    = bot_state.get("open_trade")
+pending_entry = bot_state.get("pending_entry")
 daily_pnl     = journal.get_daily_pnl_usdt()
 weekly_pnl    = journal.get_weekly_pnl_usdt()
 prev_day_high = bot_state.get("prev_day_high")
@@ -1009,17 +1010,19 @@ with tab_strategy:
         if _orb_h_s and _orb_l_s:
             st.write(f"ORB: **{_orb_l_s:,.2f}** – **{_orb_h_s:,.2f}**  |  Breakout at: **{_brk_s:,.2f}**")
 
-        # TP calculation breakdown
-        if prev_day_high and prev_day_low and _orb_h_s and _orb_l_s:
-            _pdr = (prev_day_high - prev_day_low) / prev_day_high
-            _pdr_pct = _pdr * 100
+        # TP calculation breakdown — uses the actual measured-move % that was
+        # applied to this trade (previous day's start → this session's own
+        # ORB open), not the single daily candle.
+        _range_pct = bot_state.get(f"{sig.get('session','').lower()}_range_pct")
+        if _range_pct and _orb_h_s and _orb_l_s:
+            _pdr_pct = _range_pct * 100
             if _direction == "short":
-                _tp_calc = _orb_l_s * (1.0 - _pdr)
+                _tp_calc = _orb_l_s * (1.0 - _range_pct)
                 st.caption(f"TP = ORB Low ({_orb_l_s:,.2f}) × (1 − {_pdr_pct:.3f}%) = **{_tp_calc:,.2f}**")
             else:
-                _tp_calc = _orb_h_s * (1.0 + _pdr)
+                _tp_calc = _orb_h_s * (1.0 + _range_pct)
                 st.caption(f"TP = ORB High ({_orb_h_s:,.2f}) × (1 + {_pdr_pct:.3f}%) = **{_tp_calc:,.2f}**")
-            st.caption(f"Prev day range: {prev_day_low:,.2f} – {prev_day_high:,.2f}  ({_pdr_pct:.3f}%)")
+            st.caption(f"Measured range (prev day 00:00 UTC → this session's open): {_pdr_pct:.3f}%")
     else:
         st.info("No active algo trade. Waiting for signal…")
 
@@ -1052,7 +1055,7 @@ with tab_strategy:
     with _cond_col2:
         st.markdown("""
 **Step 5 — Enter the Trade (Fade)**
-> Market order placed just inside the ORB boundary + small buffer.
+> Limit order placed slightly beyond the confirming candle's close (above it for a long, below it for a short) — not a market fill.
 > - Short (fade the sweep above ORB High)
 > - Long (fade the sweep below ORB Low)
 
@@ -1062,9 +1065,9 @@ with tab_strategy:
 > - NY: **{ny_sl:.2f}%**
 
 **Step 7 — Take Profit (Measured Move)**
-> TP = ORB boundary ± (previous day's range projected from the ORB level)
-> - Short: `TP = ORB Low × (1 − prev_day_range%)`
-> - Long: `TP = ORB High × (1 + prev_day_range%)`
+> TP = ORB boundary ± (measured range from previous day's 00:00 UTC through this session's own open)
+> - Short: `TP = ORB Low × (1 − measured_range%)`
+> - Long: `TP = ORB High × (1 + measured_range%)`
 {pdr_line}
 
 **Entry Cutoff**
@@ -1072,7 +1075,11 @@ with tab_strategy:
         """.format(
             lon_sl=config.LONDON_SL_PCT * 100,
             ny_sl=config.NY_SL_PCT * 100,
-            pdr_line=f"> Prev day range: **{(prev_day_high-prev_day_low)/prev_day_high*100:.3f}%** → TP ~{(prev_day_high-prev_day_low)/prev_day_high*100:.3f}% from ORB level" if prev_day_high and prev_day_low else "",
+            pdr_line=(
+                f"> Measured range: **{(bot_state.get('london_range_pct') or 0)*100:.3f}%** (London) / "
+                f"**{(bot_state.get('ny_range_pct') or 0)*100:.3f}%** (NY)"
+                if (bot_state.get("london_range_pct") or bot_state.get("ny_range_pct")) else ""
+            ),
         ))
 
     # ── Prev day reference prices ──────────────────────────────────────────────
@@ -1169,6 +1176,58 @@ with tab_chart:
                     )
 
         # ── Bot algo trade lines ─────────────────────────────────────────────
+        def _draw_breakout_and_sweep(sig: dict) -> None:
+            """Breakout level line + a marker showing exactly when/where on that
+            line the sweep (confirming wick) happened. Shared by both a filled
+            open trade and a still-resting pending limit entry, since the
+            breakout/sweep already happened at confirmation time either way."""
+            _bbrk = sig.get("breakout_level")
+            if not _bbrk:
+                return
+            fig.add_hline(y=_bbrk, line_dash="dashdot", line_color="yellow",
+                          line_width=1,
+                          annotation_text=f"Breakout  {_bbrk:,.2f}",
+                          annotation_position="right",
+                          annotation_font=dict(color="yellow", size=10))
+
+            _bsweep_price = sig.get("sweep_price")
+            _bsweep_time  = sig.get("sweep_time")
+            if _bsweep_price and _bsweep_time:
+                try:
+                    _bsweep_dt    = pd.to_datetime(_bsweep_time, utc=True).to_pydatetime()
+                    _bsweep_local = (_bsweep_dt + _tz_offset).replace(tzinfo=None)
+                    fig.add_trace(go.Scatter(
+                        x=[_bsweep_local], y=[_bbrk],
+                        mode="markers",
+                        marker=dict(symbol="diamond", size=11, color="yellow",
+                                    line=dict(color="black", width=1)),
+                        name="Sweep point", showlegend=False,
+                        hovertemplate=(
+                            f"Swept to {_bsweep_price:,.2f}<br>"
+                            f"{_bsweep_dt.strftime('%H:%M UTC')}<extra></extra>"
+                        ),
+                    ))
+                    fig.add_annotation(
+                        x=_bsweep_local, y=_bbrk,
+                        text=f"swept {_bsweep_price:,.2f}", showarrow=True,
+                        arrowhead=2, ay=-22,
+                        font=dict(color="yellow", size=9),
+                        bgcolor="rgba(0,0,0,0.55)",
+                    )
+                except Exception:
+                    pass
+
+        if pending_entry and not open_trade:
+            _psig = pending_entry.get("signal", {})
+            _draw_breakout_and_sweep(_psig)
+            _plimit = _psig.get("entry_price")
+            if _plimit:
+                fig.add_hline(y=_plimit, line_dash="dot", line_color="orange",
+                              line_width=1.5,
+                              annotation_text=f"Pending Limit {_psig.get('direction','').upper()}  {_plimit:,.2f}",
+                              annotation_position="right",
+                              annotation_font=dict(color="orange", size=10))
+
         if open_trade:
             sig   = open_trade.get("signal", {})
             _bdir = sig.get("direction")
@@ -1177,13 +1236,7 @@ with tab_chart:
             _btp    = sig.get("tp_price")
             _bbrk   = sig.get("breakout_level")
 
-            # Breakout level
-            if _bbrk:
-                fig.add_hline(y=_bbrk, line_dash="dashdot", line_color="yellow",
-                              line_width=1,
-                              annotation_text=f"Breakout  {_bbrk:,.2f}",
-                              annotation_position="right",
-                              annotation_font=dict(color="yellow", size=10))
+            _draw_breakout_and_sweep(sig)
 
             # P&L shading
             if current_price and _bentry and _bdir:
@@ -1583,7 +1636,7 @@ Only trade in the direction of bias.
         with _cc2:
             st.markdown(f"""
 **5 — Enter (Fade)**
-Market order just inside the ORB boundary + small buffer.
+Limit order placed slightly beyond the confirming candle's close (above it for a long, below it for a short) — not a market fill.
 
 **6 — Stop Loss**
 - London: **{config.LONDON_SL_PCT*100:.2f}%** from entry
@@ -1591,9 +1644,9 @@ Market order just inside the ORB boundary + small buffer.
 (Embedded as preset SL in the Bitget entry order)
 
 **7 — Take Profit (Measured Move)**
-- Short: `TP = ORB Low × (1 − prev_day_range%)`
-- Long:  `TP = ORB High × (1 + prev_day_range%)`
-{f"Prev day range: **{(prev_day_high-prev_day_low)/prev_day_high*100:.3f}%**" if prev_day_high and prev_day_low else "Prev day range: calculating…"}
+- Short: `TP = ORB Low × (1 − measured_range%)`
+- Long:  `TP = ORB High × (1 + measured_range%)`
+{f"Measured range: **{(bot_state.get('london_range_pct') or 0)*100:.3f}%** (London) / **{(bot_state.get('ny_range_pct') or 0)*100:.3f}%** (NY)" if (bot_state.get("london_range_pct") or bot_state.get("ny_range_pct")) else "Measured range: calculating…"}
 
 **8 — Entry Cutoff**
 No new entries within 60 min of session close.

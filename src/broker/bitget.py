@@ -184,7 +184,13 @@ class BitgetBroker:
 
     def place_stop_market_order(
         self,
-        side: str,
+        side: str,          # "buy" (long position) | "sell" (short position) — matches the
+                             # position's direction, same value as the entry order's side.
+                             # Bitget's hedge-mode `side` always tracks position direction,
+                             # NOT the literal buy/sell action needed to close it —
+                             # `tradeSide` (open/close) is what differentiates entry vs exit.
+                             # Sending the flipped action side here (the old bug) makes
+                             # Bitget label a short's SL/TP as "Close Long".
         size: float,
         stop_price: float,
         trigger: str = "mark_price",  # "mark_price" | "fill_price" | "index_price"
@@ -199,7 +205,6 @@ class BitgetBroker:
             return fake_id
 
         trade_side = "close" if reduce_only else "open"
-        hold_side  = "short" if side == "buy" else "long"  # closing the opposite position
 
         body: dict = {
             "symbol":       config.SYMBOL,
@@ -212,7 +217,6 @@ class BitgetBroker:
             "triggerType":  trigger,
             "side":         side,
             "tradeSide":    trade_side,
-            "holdSide":     hold_side,
             "orderType":    "market",
         }
         if client_id:
@@ -231,7 +235,9 @@ class BitgetBroker:
 
     def place_take_profit_order(
         self,
-        side: str,
+        side: str,           # "buy" (long position) | "sell" (short position) — see note
+                              # on place_stop_market_order: matches position direction,
+                              # not the literal closing action.
         size: float,
         limit_price: float,
         reduce_only: bool = True,
@@ -245,7 +251,6 @@ class BitgetBroker:
             return fake_id
 
         trade_side = "close" if reduce_only else "open"
-        hold_side  = "short" if side == "buy" else "long"
 
         body: dict = {
             "symbol":       config.SYMBOL,
@@ -258,7 +263,6 @@ class BitgetBroker:
             "triggerType":  "mark_price",
             "side":         side,
             "tradeSide":    trade_side,
-            "holdSide":     hold_side,
             "orderType":    "market",
         }
         if client_id:
