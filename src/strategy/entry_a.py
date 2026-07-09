@@ -71,6 +71,8 @@ class TradeSignal:
     orb_high: float
     orb_low: float
     breakout_level: float
+    sweep_price: float = 0.0        # the actual wick extreme that swept beyond the ORB boundary
+    sweep_time: Optional[str] = None  # ISO timestamp of the sweep bar
 
 
 @dataclass
@@ -102,6 +104,7 @@ class SessionStateMachine:
         self.bias_is_bearish: Optional[bool] = None
         self.breakout_level: Optional[float] = None
         self.sweep_extreme: Optional[float] = None
+        self.sweep_time: Optional[datetime] = None
         self.pending_signal: Optional[TradeSignal] = None  # limit order resting, not yet filled
         self.signal: Optional[TradeSignal] = None          # signal for the trade that actually opened
 
@@ -222,6 +225,7 @@ class SessionStateMachine:
             if bar.high > self.orb.high:
                 self.breakout_level = self.orb.high
                 self.sweep_extreme  = bar.high
+                self.sweep_time     = bar.timestamp
                 self._goto(SessionPhase.WAITING_FOR_CONFIRM,
                            f"sweep above ORB H={self.orb.high:.4f} bar_high={bar.high:.4f}")
                 return self._check_confirmation(bar)
@@ -230,6 +234,7 @@ class SessionStateMachine:
             if bar.low < self.orb.low:
                 self.breakout_level = self.orb.low
                 self.sweep_extreme  = bar.low
+                self.sweep_time     = bar.timestamp
                 self._goto(SessionPhase.WAITING_FOR_CONFIRM,
                            f"sweep below ORB L={self.orb.low:.4f} bar_low={bar.low:.4f}")
                 return self._check_confirmation(bar)
@@ -296,6 +301,8 @@ class SessionStateMachine:
             orb_high=self.orb.high,
             orb_low=self.orb.low,
             breakout_level=level,
+            sweep_price=self.sweep_extreme or 0.0,
+            sweep_time=self.sweep_time.isoformat() if self.sweep_time else None,
         )
 
         self.pending_signal = signal
@@ -437,8 +444,26 @@ class BiasCalculator:
     def compute_prev_day_range_pct(prev_high: float, prev_low: float) -> float:
         """
         Measured-move multiplier = previous day's high-low range as % of high.
-        Used for TP calculation.
+        Superseded by compute_measured_move_pct() for TP, kept for any other callers.
         """
         if prev_high <= 0:
             return 0.0
         return (prev_high - prev_low) / prev_high
+
+    @staticmethod
+    def compute_measured_move_pct(bars: list[Bar], window_start: datetime, window_end: datetime) -> Optional[float]:
+        """
+        TP measured-move %, computed as: the highest high and lowest low of ALL
+        price action from `window_start` (previous calendar day, 00:00 UTC)
+        through `window_end` (this session's own ORB-open moment) — not just
+        yesterday's single daily candle. Distance between those two extremes,
+        as a % of the highest high.
+        """
+        in_window = [b for b in bars if window_start <= b.timestamp <= window_end]
+        if not in_window:
+            return None
+        highest = max(b.high for b in in_window)
+        lowest  = min(b.low  for b in in_window)
+        if highest <= 0:
+            return None
+        return (highest - lowest) / highest
