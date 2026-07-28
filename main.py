@@ -85,6 +85,12 @@ class BotState:
         "ny_orb_low":             None,
         "ny_breakout_level":      None,
         "active_session":         None,
+        # Remote control (set externally by the Discord bot's /pause /resume
+        # /killswitch — see _sync_halt_flag()). Durable: survives restarts.
+        "trading_halted":        False,
+        "trading_halted_reason": None,   # "manual_pause" | "killswitch"
+        "trading_halted_by":     None,
+        "trading_halted_at":     None,
     }
 
     def __init__(self, path: str) -> None:
@@ -202,6 +208,9 @@ class EntryABot:
         # Pick up any manual bias override set from the dashboard since our last tick
         self._sync_bias_overrides()
 
+        # Pick up /pause, /resume, /killswitch from the Discord bot since our last tick
+        self._sync_halt_flag()
+
         last_bar = bars[-1]
         logger.debug(f"Latest bar: {last_bar.timestamp.isoformat()} "
                      f"O={last_bar.open} H={last_bar.high} L={last_bar.low} C={last_bar.close}")
@@ -235,7 +244,12 @@ class EntryABot:
             self._monitor_open_trade(last_bar)
             return  # one active trade at a time
 
-        # ── Run session state machines ──────────
+        # ── Run session state machines (skipped while halted/paused) ──
+        if self.state.trading_halted:
+            logger.debug(
+                f"Trading halted ({self.state.trading_halted_reason}) — skipping new-signal generation"
+            )
+            return
         self._run_sessions(last_bar, now)
 
     # ──────────────────────────────────────────
@@ -376,6 +390,32 @@ class EntryABot:
         if lon_ovr != self.state.london_bias_override or ny_ovr != self.state.ny_bias_override:
             logger.info(f"Bias override changed | London={lon_ovr} NY={ny_ovr}")
             self.state.set(london_bias_override=lon_ovr, ny_bias_override=ny_ovr)
+
+    def _sync_halt_flag(self) -> None:
+        """
+        Re-read the trading_halted flag from state.json. The Discord bot's
+        /pause, /resume, and /killswitch commands run in a separate process
+        and write this flag directly to the file, so our in-memory BotState
+        won't otherwise see it. Runs first, before anything else touches
+        state.json this tick, so a flag set by the Discord bot between our
+        last tick and now can't be silently clobbered by our own next _save().
+        """
+        try:
+            raw = json.loads(Path(config.STATE_FILE).read_text())
+        except Exception:
+            return
+        halted = bool(raw.get("trading_halted", False))
+        if halted != self.state.trading_halted:
+            logger.warning(
+                f"Trading halted flag changed: {halted} "
+                f"(reason={raw.get('trading_halted_reason')}, by={raw.get('trading_halted_by')})"
+            )
+        self.state.set(
+            trading_halted=halted,
+            trading_halted_reason=raw.get("trading_halted_reason"),
+            trading_halted_by=raw.get("trading_halted_by"),
+            trading_halted_at=raw.get("trading_halted_at"),
+        )
 
     # ──────────────────────────────────────────
     # Reference price tracking

@@ -130,7 +130,7 @@ class BitgetBroker:
             "symbol": config.SYMBOL,
             "productType": config.PRODUCT_TYPE,
         }
-        data = self._get("/order/orders-unfilled", params)
+        data = self._get("/order/orders-pending", params)
         raw = (data.get("data") or {})
         order_list = raw.get("entrustedList") or raw if isinstance(raw, list) else []
         orders = []

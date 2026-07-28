@@ -808,7 +808,7 @@ with tab_dash:
         with st.form("strategy_params"):
             _sp1, _sp2, _sp3 = st.columns(3)
             _new_algo_size = _sp1.number_input(
-                "Algo Position Size (USDT)", min_value=10.0, max_value=100_000.0,
+                "Algo Position Size (USDT)", min_value=1.0, max_value=100_000.0,
                 value=float(config.ALGO_POSITION_USDT), step=10.0, format="%.0f",
                 help="Fixed USDT margin per algo trade (uses configured leverage). Set 0 to use risk-% sizing.",
                 key="dash_algo_size",
@@ -1517,12 +1517,12 @@ with tab_chart:
             st.warning(
                 f"Balance **${balance:,.2f} USDT** is below required margin "
                 f"**${required_margin:,.2f} USDT** "
-                f"({_actual_btc:.4f} BTC = ${_actual_notional:,.0f} notional at {trade_lev}×)."
+                f"({_actual_btc:.4f} {_BASE_CCY} = ${_actual_notional:,.0f} notional at {trade_lev}×)."
             )
         else:
             st.caption(
                 f"Balance: **${balance:,.2f} USDT** | "
-                f"Position: **{_actual_btc:.4f} BTC** (${_actual_notional:,.0f} notional) | "
+                f"Position: **{_actual_btc:.4f} {_BASE_CCY}** (${_actual_notional:,.0f} notional) | "
                 f"Margin: **${required_margin:,.2f} USDT**"
             )
 
@@ -2293,7 +2293,7 @@ with tab_admin:
     with st.form("strategy_params_admin"):
         _sp1, _sp2, _sp3 = st.columns(3)
         _new_algo_size = _sp1.number_input(
-            "Algo Position Size (USDT)", min_value=10.0, max_value=100_000.0,
+            "Algo Position Size (USDT)", min_value=1.0, max_value=100_000.0,
             value=float(config.ALGO_POSITION_USDT), step=10.0, format="%.0f",
             help="Fixed USDT margin per algo trade (uses configured leverage). Set 0 to use risk-% sizing.",
             key="admin_algo_size",

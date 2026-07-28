@@ -21,6 +21,7 @@ env/
 logs/
 state/
 *.log
+discord_bot/data/
 
 # IDE
 .vscode/

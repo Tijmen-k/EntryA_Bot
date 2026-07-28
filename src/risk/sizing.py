@@ -20,6 +20,12 @@ import config
 # ── Scaling Ladder ────────────────────────────────────────────────────────────
 # Single source of truth. Edit ONLY here — bot and dashboard both import this.
 # Rows are (min_equity, default_usdt, boosted_usdt), highest equity first.
+#
+# To run this exact ladder shape at a different scale (e.g. a small test
+# deposit), set config.LADDER_SCALE_FACTOR in .env instead of editing these
+# numbers — every row is multiplied by that factor when SCALING_LADDER is
+# built below. Set it back to 1.0 to restore the numbers exactly as written
+# here.
 
 _RAW = [
     (40_000.0, 5_200.0, 10_400.0),
@@ -50,11 +56,29 @@ class ScalingRung:
     boosted_usdt: float
 
 
-# Build ascending (Level 1 = $1,000, Level 17 = $40,000)
+_scale = config.LADDER_SCALE_FACTOR
+
+# Build ascending (Level 1 = lowest equity rung, Level 17 = highest), scaled
+# by LADDER_SCALE_FACTOR. At scale=1.0 this is Level 1 = $1,000 / $300 / $600
+# ... Level 17 = $40,000 / $5,200 / $10,400, exactly as in _RAW above.
 SCALING_LADDER: list[ScalingRung] = [
-    ScalingRung(level=i + 1, min_equity=eq, default_usdt=d, boosted_usdt=b)
+    ScalingRung(
+        level=i + 1,
+        min_equity=eq * _scale,
+        default_usdt=d * _scale,
+        boosted_usdt=b * _scale,
+    )
     for i, (eq, d, b) in enumerate(reversed(_RAW))
 ]
+
+if _scale != 1.0:
+    logger.warning(
+        f"LADDER_SCALE_FACTOR={_scale} — scaling ladder is running at {_scale}x "
+        f"the base table (Level 1: ${SCALING_LADDER[0].min_equity:,.2f} equity / "
+        f"${SCALING_LADDER[0].default_usdt:,.2f} default / "
+        f"${SCALING_LADDER[0].boosted_usdt:,.2f} boosted). "
+        "Set LADDER_SCALE_FACTOR=1.0 in .env to restore the original sizing."
+    )
 
 
 # ── Ladder helpers ────────────────────────────────────────────────────────────
