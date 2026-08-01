@@ -9,8 +9,10 @@ and reshapes the results into small dataclasses for the cogs to format.
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 import config as trading_config
@@ -101,16 +103,29 @@ async def get_current_price() -> Optional[float]:
     )
 
 
+def _read_open_trade_signal() -> Optional[dict]:
+    """SL/TP live in the strategy signal (state.json), not as regular pending orders —
+    Bitget places them as preset/plan orders attached to the position, which
+    get_open_orders() (pending limit/market orders only) can never see."""
+    try:
+        path = Path(bot_config.STATE_FILE)
+        if not path.exists():
+            return None
+        state = json.loads(path.read_text())
+    except Exception:
+        return None
+    open_trade = state.get("open_trade")
+    return (open_trade or {}).get("signal")
+
+
 @dataclass
 class PositionDetail:
     position: Position
     mark_price: Optional[float]
     unrealised_pnl_pct: Optional[float]
-    attached_sl: Optional[Order]
-    attached_tp: Optional[Order]
+    sl_price: Optional[float]
+    tp_price: Optional[float]
     session: Optional[str]
-    source: Optional[str]
-    leverage: Optional[int]
     entry_time: Optional[str]
 
 
@@ -126,10 +141,20 @@ async def get_position_detail(symbol: str) -> Optional[PositionDetail]:
         direction = 1 if position.side == "long" else -1
         unrealised_pct = direction * (price - position.entry_price) / position.entry_price * 100
 
-    orders = await get_orders()
-    symbol_orders = [o for o in orders if o.symbol.upper() == symbol.upper()]
-    sl = next((o for o in symbol_orders if o.order_type == "stop"), None)
-    tp = next((o for o in symbol_orders if o.limit_price and o.order_type != "stop"), None)
+    signal = await asyncio.to_thread(_read_open_trade_signal)
+    sl_price = (signal or {}).get("sl_price")
+    tp_price = (signal or {}).get("tp_price")
+
+    if sl_price is None or tp_price is None:
+        # Fallback for positions the strategy didn't open (e.g. manual trades)
+        orders = await get_orders()
+        symbol_orders = [o for o in orders if o.symbol.upper() == symbol.upper()]
+        if sl_price is None:
+            order_sl = next((o for o in symbol_orders if o.order_type == "stop"), None)
+            sl_price = order_sl.stop_price if order_sl else None
+        if tp_price is None:
+            order_tp = next((o for o in symbol_orders if o.limit_price and o.order_type != "stop"), None)
+            tp_price = order_tp.limit_price if order_tp else None
 
     open_trades = await asyncio.to_thread(journal_db.get_open_journal_trades)
     journal_row = next((t for t in open_trades if t["symbol"].upper() == symbol.upper()), None)
@@ -138,10 +163,8 @@ async def get_position_detail(symbol: str) -> Optional[PositionDetail]:
         position=position,
         mark_price=price,
         unrealised_pnl_pct=unrealised_pct,
-        attached_sl=sl,
-        attached_tp=tp,
+        sl_price=sl_price,
+        tp_price=tp_price,
         session=journal_row["session"] if journal_row else None,
-        source=journal_row["source"] if journal_row else None,
-        leverage=journal_row["leverage"] if journal_row else None,
         entry_time=journal_row["entry_time"] if journal_row else None,
     )

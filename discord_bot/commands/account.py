@@ -9,7 +9,7 @@ from loguru import logger
 import discord_bot.config as bot_config
 from discord_bot.services import account_service
 from discord_bot.utils.embeds import base_embed, Status
-from discord_bot.utils.formatting import code_table, pct, progress_bar, usdt
+from discord_bot.utils.formatting import code_table, hhmm, pct, progress_bar, usdt
 
 
 class Account(commands.Cog):
@@ -84,18 +84,16 @@ class Account(commands.Cog):
         embed.add_field(name="Unrealized %", value=pct(detail.unrealised_pnl_pct), inline=True)
         embed.add_field(
             name="Stop Loss",
-            value=f"{detail.attached_sl.stop_price:,.2f}" if detail.attached_sl and detail.attached_sl.stop_price else "None",
+            value=f"{detail.sl_price:,.2f}" if detail.sl_price else "None",
             inline=True,
         )
         embed.add_field(
             name="Take Profit",
-            value=f"{detail.attached_tp.limit_price:,.2f}" if detail.attached_tp and detail.attached_tp.limit_price else "None",
+            value=f"{detail.tp_price:,.2f}" if detail.tp_price else "None",
             inline=True,
         )
         embed.add_field(name="Session", value=detail.session or "—", inline=True)
-        embed.add_field(name="Source", value=detail.source or "—", inline=True)
-        embed.add_field(name="Leverage", value=f"{detail.leverage}x" if detail.leverage else "—", inline=True)
-        embed.add_field(name="Entry Time", value=detail.entry_time or "—", inline=False)
+        embed.add_field(name="Entry Time", value=hhmm(detail.entry_time), inline=False)
         await interaction.followup.send(embed=embed)
 
     @app_commands.command(name="orders", description="Show all pending (unfilled) orders.")

@@ -42,7 +42,7 @@ class Charts(commands.Cog):
         self,
         interaction: discord.Interaction,
         symbol: str = bot_config.SYMBOL,
-        resolution: Literal["1m", "5m", "15m", "1h", "4h", "1d"] = "15m",
+        resolution: Literal["1m", "5m", "15m", "1h", "4h", "1d"] = "1m",
         bars: app_commands.Range[int, 20, 500] = 150,
     ) -> None:
         logger.info(f"/chart {symbol} {resolution} {bars} invoked by {interaction.user}")
@@ -74,18 +74,26 @@ class Charts(commands.Cog):
 
         current_price = await feed_service.get_current_price_cached(symbol)
         detail = await account_service.get_position_detail(symbol)
-        sl_price = detail.attached_sl.stop_price if detail and detail.attached_sl else None
-        tp_price = detail.attached_tp.limit_price if detail and detail.attached_tp else None
+        sl_price = detail.sl_price if detail else None
+        tp_price = detail.tp_price if detail else None
+        entry_price = detail.position.entry_price if detail else None
+        side = detail.position.side if detail else None
+        pnl_usdt = detail.position.unrealised_pnl if detail else None
 
         png_bytes = render_candles(
             candles, symbol, resolution,
             trades=markers, current_price=current_price, sl_price=sl_price, tp_price=tp_price,
+            entry_price=entry_price, side=side, pnl_usdt=pnl_usdt,
         )
 
         file = discord.File(io.BytesIO(png_bytes), filename=f"{symbol}_{resolution}.png")
         embed = base_embed(f"{symbol} — {resolution}", Status.INFO)
         if current_price:
             embed.add_field(name="Current Price", value=f"{current_price:,.2f}", inline=True)
+        if detail:
+            embed.add_field(name="Position", value=f"{side.upper()} @ {entry_price:,.2f}", inline=True)
+            if pnl_usdt is not None:
+                embed.add_field(name="Live P&L", value=f"${pnl_usdt:+,.2f}", inline=True)
         embed.set_image(url=f"attachment://{symbol}_{resolution}.png")
         await interaction.followup.send(embed=embed, file=file)
 

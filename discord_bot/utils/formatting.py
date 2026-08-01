@@ -1,6 +1,18 @@
 """Small, dependency-free formatting helpers reused across every cog."""
 from __future__ import annotations
 
+from datetime import datetime
+
+
+def hhmm(iso_str: str | None) -> str:
+    """Format an ISO timestamp as a simple HH:MM (UTC, matches Bitget's website — no tz conversion)."""
+    if not iso_str:
+        return "—"
+    try:
+        return datetime.fromisoformat(iso_str).strftime("%H:%M")
+    except ValueError:
+        return iso_str
+
 
 def usdt(value: float | None, signed: bool = False) -> str:
     if value is None:
@@ -36,6 +48,29 @@ def code_table(headers: list[str], rows: list[list[str]], max_rows: int | None =
     lines = [fmt_row(headers), fmt_row(["-" * w for w in widths])]
     lines.extend(fmt_row(row) for row in rows)
     return "```\n" + "\n".join(lines) + "\n```"
+
+
+def diff_table(headers: list[str], rows: list[list[str]], row_signs: list[bool | None]) -> str:
+    """Column-aligned table in a ```diff block — wins render green (+), losses red (-).
+
+    `row_signs[i]` is True for a win row, False for a loss row, None for neutral (no color).
+    """
+    if not rows:
+        return "```\n(no data)\n```"
+
+    widths = [len(h) for h in headers]
+    for row in rows:
+        for i, cell in enumerate(row):
+            widths[i] = max(widths[i], len(cell))
+
+    def fmt_row(cells: list[str], prefix: str) -> str:
+        return prefix + " ".join(cell.ljust(widths[i]) for i, cell in enumerate(cells))
+
+    lines = [fmt_row(headers, "  "), fmt_row(["-" * w for w in widths], "  ")]
+    for row, sign in zip(rows, row_signs):
+        prefix = "+ " if sign is True else "- " if sign is False else "  "
+        lines.append(fmt_row(row, prefix))
+    return "```diff\n" + "\n".join(lines) + "\n```"
 
 
 def progress_bar(pct_complete: float, width: int = 20) -> str:

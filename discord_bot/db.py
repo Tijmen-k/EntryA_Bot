@@ -1,8 +1,7 @@
 """
-SQLite storage for the Discord bot's own concerns: per-guild alert
-subscriptions, a health snapshot for /health, and an audit trail of every
-mutating command. Trade/performance data is never duplicated here — it's
-always read live from src/journal/db.py.
+SQLite storage for the Discord bot's own concerns: a health snapshot for
+/health, and an audit trail of every mutating command. Trade/performance
+data is never duplicated here — it's always read live from src/journal/db.py.
 
 Sync stdlib sqlite3, same style as src/journal/db.py. Swappable for
 PostgreSQL later by replacing this module's connection/query layer only —
@@ -16,10 +15,6 @@ from pathlib import Path
 from typing import Optional
 
 import discord_bot.config as bot_config
-
-_ALLOWED_EVENT_TYPES = (
-    "trade_open", "trade_close", "killswitch", "ladder_boost", "error", "daily_report",
-)
 
 
 def _conn() -> sqlite3.Connection:
@@ -38,18 +33,6 @@ def init_db() -> None:
                 timezone_display TEXT NOT NULL DEFAULT 'UTC',
                 created_at       TEXT NOT NULL,
                 updated_at       TEXT NOT NULL
-            )
-        """)
-        conn.execute(f"""
-            CREATE TABLE IF NOT EXISTS alert_subscriptions (
-                id          INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id    TEXT    NOT NULL,
-                channel_id  TEXT    NOT NULL,
-                event_type  TEXT    NOT NULL CHECK (event_type IN {_ALLOWED_EVENT_TYPES!r}),
-                enabled     INTEGER NOT NULL DEFAULT 1,
-                created_at  TEXT    NOT NULL,
-                updated_at  TEXT    NOT NULL,
-                UNIQUE(guild_id, channel_id, event_type)
             )
         """)
         conn.execute("""
@@ -74,50 +57,6 @@ def init_db() -> None:
             )
         """)
         conn.commit()
-
-
-# ── Alert subscriptions ────────────────────────────────────────────────────────
-
-def add_subscription(guild_id: str, channel_id: str, event_type: str) -> None:
-    if event_type not in _ALLOWED_EVENT_TYPES:
-        raise ValueError(f"Unknown event_type: {event_type}")
-    now = datetime.now(timezone.utc).isoformat()
-    with _conn() as conn:
-        conn.execute("""
-            INSERT INTO alert_subscriptions (guild_id, channel_id, event_type, enabled, created_at, updated_at)
-            VALUES (?, ?, ?, 1, ?, ?)
-            ON CONFLICT(guild_id, channel_id, event_type)
-            DO UPDATE SET enabled = 1, updated_at = excluded.updated_at
-        """, (guild_id, channel_id, event_type, now, now))
-        conn.commit()
-
-
-def remove_subscription(guild_id: str, channel_id: str, event_type: str) -> None:
-    with _conn() as conn:
-        conn.execute("""
-            UPDATE alert_subscriptions SET enabled = 0, updated_at = ?
-            WHERE guild_id = ? AND channel_id = ? AND event_type = ?
-        """, (datetime.now(timezone.utc).isoformat(), guild_id, channel_id, event_type))
-        conn.commit()
-
-
-def list_subscriptions(guild_id: str) -> list[dict]:
-    with _conn() as conn:
-        rows = conn.execute("""
-            SELECT * FROM alert_subscriptions
-            WHERE guild_id = ? AND enabled = 1
-            ORDER BY event_type ASC
-        """, (guild_id,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def list_all_active_subscriptions(event_type: str) -> list[dict]:
-    """Every enabled subscription for an event type, across all guilds — used by the alert poller."""
-    with _conn() as conn:
-        rows = conn.execute("""
-            SELECT * FROM alert_subscriptions WHERE event_type = ? AND enabled = 1
-        """, (event_type,)).fetchall()
-    return [dict(r) for r in rows]
 
 
 # ── Health snapshot ─────────────────────────────────────────────────────────────

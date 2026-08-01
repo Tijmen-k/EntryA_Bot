@@ -41,13 +41,21 @@ def render_candles(
     current_price: Optional[float] = None,
     sl_price: Optional[float] = None,
     tp_price: Optional[float] = None,
+    entry_price: Optional[float] = None,
+    side: Optional[str] = None,
+    pnl_usdt: Optional[float] = None,
 ) -> bytes:
-    """Render a dark-theme candlestick chart with volume, trade markers, and SL/TP lines. Returns PNG bytes."""
+    """Render a dark-theme candlestick chart with trade markers and SL/TP lines.
+
+    When `entry_price`/`side` are given (an open position on this symbol), the region
+    between entry and the current price is shaded green/red by profit direction and the
+    live P&L (USDT) is annotated — mirroring the in-position view on the Streamlit dashboard.
+    Returns PNG bytes.
+    """
     trades = trades or []
     fig = Figure(figsize=(11, 7), dpi=150)
     canvas = FigureCanvasAgg(fig)
-    ax_price = fig.add_axes((0.07, 0.28, 0.90, 0.66))
-    ax_vol   = fig.add_axes((0.07, 0.08, 0.90, 0.16), sharex=ax_price)
+    ax_price = fig.add_axes((0.07, 0.10, 0.90, 0.84))
 
     xs = mdates.date2num([b.timestamp for b in bars])
     if len(xs) > 1:
@@ -65,7 +73,6 @@ def render_candles(
             (x - bar_width / 2, body_low), bar_width, body_h,
             facecolor=color, edgecolor=color, zorder=3,
         ))
-        ax_vol.bar(x, bar.volume, width=bar_width, color=color, alpha=0.6)
 
     for t in trades:
         entry_color = style.ENTRY_MARKER
@@ -77,6 +84,30 @@ def render_candles(
             ax_price.scatter([mdates.date2num(t.exit_time)], [t.exit_price],
                               color=exit_color, marker="x", s=90, zorder=5, label="_nolegend_")
 
+    if entry_price is not None and side is not None and current_price is not None:
+        in_profit = (side == "long" and current_price > entry_price) or \
+                    (side == "short" and current_price < entry_price)
+        fill_color = style.BULLISH if in_profit else style.BEARISH
+        ax_price.axhspan(
+            min(entry_price, current_price), max(entry_price, current_price),
+            facecolor=fill_color, alpha=0.12, zorder=1,
+        )
+        entry_color = style.BULLISH if side == "long" else style.BEARISH
+        ax_price.axhline(entry_price, color=entry_color, linewidth=2,
+                          label=f"{side.upper()} entry {entry_price:,.2f}")
+
+        xs_last = xs[-1] if len(xs) else mdates.date2num(bars[-1].timestamp)
+        pnl_label = f"${pnl_usdt:+,.2f}" if pnl_usdt is not None else ("+" if in_profit else "-")
+        ax_price.annotate(
+            pnl_label, xy=(xs_last, current_price), xytext=(8, 0),
+            textcoords="offset points", va="center", fontsize=11, fontweight="bold",
+            color=style.BULLISH if in_profit else style.BEARISH,
+        )
+    elif entry_price is not None and side is not None:
+        entry_color = style.BULLISH if side == "long" else style.BEARISH
+        ax_price.axhline(entry_price, color=entry_color, linewidth=2,
+                          label=f"{side.upper()} entry {entry_price:,.2f}")
+
     if sl_price is not None:
         ax_price.axhline(sl_price, color=style.SL_LINE, linestyle="--", linewidth=1.2, label=f"SL {sl_price:,.2f}")
     if tp_price is not None:
@@ -85,23 +116,20 @@ def render_candles(
         ax_price.axhline(current_price, color=style.TEXT_MUTED, linestyle=":", linewidth=1.0,
                           label=f"Current {current_price:,.2f}")
 
-    if sl_price is not None or tp_price is not None or current_price is not None:
+    if sl_price is not None or tp_price is not None or current_price is not None or entry_price is not None:
         legend = ax_price.legend(loc="upper left", frameon=False, fontsize=8)
         for text in legend.get_texts():
             text.set_color(style.TEXT)
 
     ax_price.set_title(f"{symbol}  —  {resolution}", color=style.TEXT, fontsize=13, loc="left", pad=10)
     ax_price.set_ylabel("Price")
-    ax_vol.set_ylabel("Volume")
-    ax_price.tick_params(labelbottom=False)
-    ax_vol.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
-    for label in ax_vol.get_xticklabels():
+    ax_price.xaxis.set_major_formatter(mdates.DateFormatter("%m-%d %H:%M"))
+    for label in ax_price.get_xticklabels():
         label.set_rotation(30)
         label.set_ha("right")
 
-    for ax in (ax_price, ax_vol):
-        for spine in ax.spines.values():
-            spine.set_color(style.GRID)
+    for spine in ax_price.spines.values():
+        spine.set_color(style.GRID)
 
     buf = io.BytesIO()
     canvas.print_png(buf)

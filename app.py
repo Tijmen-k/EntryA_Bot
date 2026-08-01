@@ -365,7 +365,7 @@ with st.container():
 
     with hc4:
         refresh_secs = st.select_slider(
-            "Refresh interval", options=[15, 30, 60, 120], value=30,
+            "Refresh interval", options=[30, 60, 120, 300], value=60,
             format_func=lambda v: f"{v}s", label_visibility="collapsed",
         )
     with hc5:
@@ -575,12 +575,15 @@ with tab_dash:
                 _r10p  = sum(t["pnl_usdt"] or 0 for t in _recent10)
                 _r10avg = _r10p / len(_recent10)
                 _r10c  = "#00cc96" if _r10p >= 0 else "#ef553b"
-                st.markdown(
+                # Use &#36; instead of a literal "$" — Streamlit's markdown treats a pair of
+                # bare "$" as inline LaTeX math, which would swallow everything between the
+                # two values (including the HTML tags) and print it back out as raw text.
+                _r10_html = (
                     f"WR: **{_r10w/len(_recent10)*100:.0f}%** &nbsp;·&nbsp; "
-                    f"P&L: <span style='color:{_r10c}'><b>${_r10p:+.2f}</b></span> &nbsp;·&nbsp; "
-                    f"Avg: <span style='color:{_r10c}'><b>${_r10avg:+.2f}</b></span>",
-                    unsafe_allow_html=True,
+                    f"P&L: <span style='color:{_r10c}'><b>&#36;{_r10p:+.2f}</b></span> &nbsp;·&nbsp; "
+                    f"Avg: <span style='color:{_r10c}'><b>&#36;{_r10avg:+.2f}</b></span>"
                 )
+                st.markdown(_r10_html, unsafe_allow_html=True)
             else:
                 st.info("No closed trades yet.")
 
@@ -1972,7 +1975,10 @@ with tab_journal:
                      "pnl_usdt", "pnl_pct", "fees_usdt", "leverage",
                      "session", "source", "status", "notes"]
         df = df[[c for c in show_cols if c in df.columns]]
-        df.columns = [c.replace("_", " ").title() for c in df.columns]
+        df.columns = [
+            f"Size {_BASE_CCY}" if c == "size_btc" else c.replace("_", " ").title()
+            for c in df.columns
+        ]
 
         # Colour P&L column
         def _color_pnl(val):
@@ -2058,16 +2064,16 @@ with tab_journal:
     Level {_pb['old_level']} → {_pb['new_level']} — Position Boost Unlocked!
   </div>
   <div style="font-size:13px; color:#2a2a2a; margin-top:6px;">
-    Default ${_pb['old_position_usdt']:,.0f} → <b>${_pb['new_position_usdt']:,.0f} USDT</b>
+    Default &#36;{_pb['old_position_usdt']:,.0f} → <b>&#36;{_pb['new_position_usdt']:,.0f} USDT</b>
     &nbsp;(+{_pct_inc:.0f}%) &nbsp;·&nbsp; from trade #{_pb['trade_count'] + 1}
   </div>
 </div>
 """, unsafe_allow_html=True)
 
     _jm1, _jm2, _jm3, _jm4, _jm5, _jm6 = st.columns(6)
-    _jm1.metric("Equity",        f"${_eq:,.0f}")
+    _jm1.metric("Equity",        f"${_eq:,.2f}")
     _jm2.metric("Position Size", f"${_pos_usdt_active:,.0f}")
-    _jm3.metric("BTC Size",      f"{_pos_btc:.4f}")
+    _jm3.metric(f"{_BASE_CCY} Size",  f"{_pos_btc:.4f}")
     _jm4.metric("Wins / Last 6", f"{_streak['wins_in_last_6']} / {_streak['trades_in_last_6']}")
     _jm5.metric("2x Win Streak", "Yes" if _streak["last_2_wins"] else "No")
     _jm6.metric("Next Level At", f"${_nxt.min_equity:,.0f}" if _nxt else "MAX")

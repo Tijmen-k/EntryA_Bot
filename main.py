@@ -845,13 +845,14 @@ class EntryABot:
         except Exception:
             pass
 
-        # Calculate approximate P&L % for risk tracking
+        # Calculate approximate P&L % for risk tracking (raw price move, not leveraged —
+        # e.g. a 0.85% SL is reported as 0.85%, not 0.85% * leverage)
         entry      = sig["entry_price"]
         direction  = sig["direction"]
         pnl_pct = (
             (entry - exit_price) / entry if direction == "short"
             else (exit_price - entry) / entry
-        ) * config.LEVERAGE
+        )
 
         daily  = self.state.daily_pnl_pct  + pnl_pct
         weekly = self.state.weekly_pnl_pct + pnl_pct

@@ -104,7 +104,7 @@ SESSIONS: list[SessionConfig] = [
         orb_start_m=int(os.getenv("NY_ORB_START_M", "0")),
         orb_end_h=  int(os.getenv("NY_ORB_END_H",   "12")),
         orb_end_m=  int(os.getenv("NY_ORB_END_M",   "30")),
-        session_close_h=23, session_close_m=0,
+        session_close_h=21, session_close_m=0,
         sl_pct=NY_SL_PCT,
     ),
 ]

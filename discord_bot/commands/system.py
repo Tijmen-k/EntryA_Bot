@@ -1,4 +1,4 @@
-"""/logs /alerts /help — log tailing, alert subscription management, and command help."""
+"""/logs /help — log tailing and command help."""
 from __future__ import annotations
 
 from typing import Literal
@@ -8,7 +8,7 @@ from discord import app_commands
 from discord.ext import commands
 from loguru import logger
 
-from discord_bot.services import alert_service, log_service
+from discord_bot.services import log_service
 from discord_bot.utils.embeds import base_embed, Status
 from discord_bot.utils.formatting import truncate
 
@@ -48,53 +48,6 @@ class System(commands.Cog):
         status = Status.CRITICAL if category == "errors" else (Status.WARNING if category == "warnings" else Status.INFO)
         embed = base_embed(f"Logs — {category} (last {len(lines)})", status, f"```\n{body}\n```")
         await interaction.followup.send(embed=embed)
-
-    alerts_group = app_commands.Group(name="alerts", description="Manage which events post to this channel.")
-
-    @alerts_group.command(name="list", description="List active alert subscriptions for this server.")
-    async def alerts_list(self, interaction: discord.Interaction) -> None:
-        logger.info(f"/alerts list invoked by {interaction.user}")
-        if not interaction.guild_id:
-            await interaction.response.send_message(embed=base_embed("Alerts", Status.WARNING, "This command must be used in a server."))
-            return
-        subs = await alert_service.list_subscriptions(str(interaction.guild_id))
-        if not subs:
-            await interaction.response.send_message(embed=base_embed("Alert Subscriptions", Status.INFO, "No active subscriptions."))
-            return
-        lines = "\n".join(f"- {s['event_type']}  →  <#{s['channel_id']}>" for s in subs)
-        await interaction.response.send_message(embed=base_embed("Alert Subscriptions", Status.INFO, lines))
-
-    @alerts_group.command(name="subscribe", description="Subscribe this channel to an event type.")
-    @app_commands.describe(event_type="Which event to receive alerts for")
-    async def alerts_subscribe(
-        self,
-        interaction: discord.Interaction,
-        event_type: Literal["trade_open", "trade_close", "killswitch", "ladder_boost", "error", "daily_report"],
-    ) -> None:
-        logger.info(f"/alerts subscribe {event_type} invoked by {interaction.user}")
-        if not interaction.guild_id:
-            await interaction.response.send_message(embed=base_embed("Alerts", Status.WARNING, "This command must be used in a server."))
-            return
-        await alert_service.subscribe(str(interaction.guild_id), str(interaction.channel_id), event_type)
-        await interaction.response.send_message(
-            embed=base_embed("Subscribed", Status.OK, f"This channel will now receive `{event_type}` alerts.")
-        )
-
-    @alerts_group.command(name="unsubscribe", description="Unsubscribe this channel from an event type.")
-    @app_commands.describe(event_type="Which event to stop receiving alerts for")
-    async def alerts_unsubscribe(
-        self,
-        interaction: discord.Interaction,
-        event_type: Literal["trade_open", "trade_close", "killswitch", "ladder_boost", "error", "daily_report"],
-    ) -> None:
-        logger.info(f"/alerts unsubscribe {event_type} invoked by {interaction.user}")
-        if not interaction.guild_id:
-            await interaction.response.send_message(embed=base_embed("Alerts", Status.WARNING, "This command must be used in a server."))
-            return
-        await alert_service.unsubscribe(str(interaction.guild_id), str(interaction.channel_id), event_type)
-        await interaction.response.send_message(
-            embed=base_embed("Unsubscribed", Status.OK, f"This channel will no longer receive `{event_type}` alerts.")
-        )
 
     @app_commands.command(name="help", description="Show all available commands.")
     async def help(self, interaction: discord.Interaction) -> None:

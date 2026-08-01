@@ -9,7 +9,7 @@ from loguru import logger
 import discord_bot.config as bot_config
 from discord_bot.services import performance_service, report_service
 from discord_bot.utils.embeds import base_embed, Status
-from discord_bot.utils.formatting import code_table, usdt
+from discord_bot.utils.formatting import diff_table, hhmm, usdt
 
 
 class Performance(commands.Cog):
@@ -52,28 +52,38 @@ class Performance(commands.Cog):
 
         rows = [
             [
-                (t["entry_time"] or "")[:10],
-                t["session"] or "-",
-                (t["side"] or "-").upper(),
+                hhmm(t["entry_time"]),
+                (t["session"] or "-")[:3].upper(),
+                (t["side"] or "-")[:1].upper(),
                 f"{t['entry_price']:,.2f}" if t["entry_price"] else "-",
                 f"{t['exit_price']:,.2f}" if t["exit_price"] else "-",
                 f"{t['pnl_usdt']:+,.2f}" if t["pnl_usdt"] is not None else "-",
-                f"{t['pnl_pct']*100:+.2f}%" if t["pnl_pct"] is not None else "-",
+                f"{t['pnl_pct']:+.2f}%" if t["pnl_pct"] is not None else "-",
             ]
             for t in trades
         ]
-        table = code_table(["Date", "Session", "Side", "Entry", "Exit", "PnL$", "PnL%"], rows)
-        total_pnl = sum(t["pnl_usdt"] or 0 for t in trades)
-        embed = base_embed(f"Trade History (last {len(trades)})", color_for_pnl_status(total_pnl), table)
-        await interaction.followup.send(embed=embed)
+        row_signs = [(t["pnl_usdt"] or 0) >= 0 if t["pnl_usdt"] is not None else None for t in trades]
+        table = diff_table(["Time", "Ses", "S", "Entry", "Exit", "PnL$", "PnL%"], rows, row_signs)
 
-    @app_commands.command(name="dailyreport", description="Generate and export a full end-of-day PDF report.")
+        total_pnl = sum(t["pnl_usdt"] or 0 for t in trades)
+        wins = sum(1 for t in trades if (t["pnl_usdt"] or 0) > 0)
+        win_rate = wins / len(trades) * 100
+        summary = f"**{wins}/{len(trades)}** wins ({win_rate:.0f}%)  ·  Total: {usdt(total_pnl, signed=True)}"
+
+        embed = base_embed(f"Trade History (last {len(trades)})", color_for_pnl_status(total_pnl), summary)
+        await interaction.followup.send(embed=embed)
+        # Sent as a plain message rather than inside the embed — embeds render at a fixed,
+        # narrower width than the chat column, which was wrapping the PnL% column onto its
+        # own line (landing under Time). A top-level code block gets the full chat width.
+        await interaction.followup.send(table)
+
+    @app_commands.command(name="dailyreport", description="Show a summary of today's trading performance.")
     async def dailyreport(self, interaction: discord.Interaction) -> None:
         logger.info(f"/dailyreport invoked by {interaction.user}")
         await interaction.response.defer(thinking=True)
 
-        pdf_bytes, summary = await report_service.build_daily_report()
-        if pdf_bytes is None:
+        summary = await report_service.build_daily_report()
+        if summary is None:
             await interaction.followup.send(
                 embed=base_embed("Daily Report", Status.INFO, "No trades recorded today — nothing to report.")
             )
@@ -83,8 +93,46 @@ class Performance(commands.Cog):
         embed.add_field(name="Trades Today", value=str(summary.total_trades), inline=True)
         embed.add_field(name="Net Return", value=usdt(summary.total_pnl, signed=True), inline=True)
         embed.add_field(name="Win Rate", value=f"{summary.win_rate:.1f}%", inline=True)
+        await interaction.followup.send(embed=embed)
 
-        file = discord.File(pdf_bytes, filename="daily_report.pdf")
+    @app_commands.command(name="weeklyreport", description="Generate and export a full weekly PDF report.")
+    async def weeklyreport(self, interaction: discord.Interaction) -> None:
+        logger.info(f"/weeklyreport invoked by {interaction.user}")
+        await interaction.response.defer(thinking=True)
+
+        pdf_bytes, summary = await report_service.build_weekly_report()
+        if pdf_bytes is None:
+            await interaction.followup.send(
+                embed=base_embed("Weekly Report", Status.INFO, "No trades recorded this week — nothing to report.")
+            )
+            return
+
+        embed = base_embed("Weekly Report", color_for_pnl_status(summary.total_pnl))
+        embed.add_field(name="Trades This Week", value=str(summary.total_trades), inline=True)
+        embed.add_field(name="Net Return", value=usdt(summary.total_pnl, signed=True), inline=True)
+        embed.add_field(name="Win Rate", value=f"{summary.win_rate:.1f}%", inline=True)
+
+        file = discord.File(pdf_bytes, filename="weekly_report.pdf")
+        await interaction.followup.send(embed=embed, file=file)
+
+    @app_commands.command(name="monthlyreport", description="Generate and export a full monthly PDF report.")
+    async def monthlyreport(self, interaction: discord.Interaction) -> None:
+        logger.info(f"/monthlyreport invoked by {interaction.user}")
+        await interaction.response.defer(thinking=True)
+
+        pdf_bytes, summary = await report_service.build_monthly_report()
+        if pdf_bytes is None:
+            await interaction.followup.send(
+                embed=base_embed("Monthly Report", Status.INFO, "No trades recorded this month — nothing to report.")
+            )
+            return
+
+        embed = base_embed("Monthly Report", color_for_pnl_status(summary.total_pnl))
+        embed.add_field(name="Trades This Month", value=str(summary.total_trades), inline=True)
+        embed.add_field(name="Net Return", value=usdt(summary.total_pnl, signed=True), inline=True)
+        embed.add_field(name="Win Rate", value=f"{summary.win_rate:.1f}%", inline=True)
+
+        file = discord.File(pdf_bytes, filename="monthly_report.pdf")
         await interaction.followup.send(embed=embed, file=file)
 
 
