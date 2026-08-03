@@ -8,7 +8,7 @@ import json
 import os
 import subprocess
 import time
-from datetime import datetime, timezone, time as _dt_time, timedelta as _timedelta
+from datetime import datetime, timezone, time as _dt_time
 from pathlib import Path
 
 import pandas as pd
@@ -27,7 +27,6 @@ from src.journal import db as journal
 from src.notifications.discord import DiscordNotifier
 from src.utils import process_control
 from src.risk.sizing import SCALING_LADDER, get_ladder_progress, boost_streak_info
-from src.backtest.simulator import fetch_day_bars, fetch_reference_prices, run_simulation
 
 _notifier = DiscordNotifier(config.DISCORD_WEBHOOK_URL)
 
@@ -164,10 +163,6 @@ st.markdown("""
 if "bot_proc"     not in st.session_state: st.session_state.bot_proc     = None
 if "dry_run"      not in st.session_state: st.session_state.dry_run      = config.DRY_RUN
 if "manual_trade" not in st.session_state: st.session_state.manual_trade = None
-if "sim_result"   not in st.session_state: st.session_state.sim_result   = None
-if "sim_date"     not in st.session_state: st.session_state.sim_date     = None
-if "sim_index"    not in st.session_state: st.session_state.sim_index    = 0
-if "sim_playing"  not in st.session_state: st.session_state.sim_playing  = False
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -222,9 +217,16 @@ def stop_bot() -> None:
     st.session_state.bot_proc = None
 
 
+@st.cache_resource
+def _get_feed() -> BitgetFeed:
+    """Public, read-only market-data client — safe to share as a long-lived
+    singleton (no dry-run/order-placement state, unlike BitgetBroker)."""
+    return BitgetFeed()
+
+
 @st.cache_data(ttl=30)
 def fetch_market_data():
-    feed  = BitgetFeed()
+    feed  = _get_feed()
     bars  = feed.fetch_ohlcv(config.SYMBOL, config.RESOLUTION, count=200)
     price = feed.get_current_price(config.SYMBOL)
     return bars, price
@@ -234,7 +236,7 @@ def fetch_market_data():
 def fetch_bias_data():
     """Compute London/NY bias directly from bars — works whether bot is running or not."""
     from datetime import timedelta
-    feed      = BitgetFeed()
+    feed      = _get_feed()
     now_utc   = datetime.now(timezone.utc)
     today     = now_utc.date()
     yesterday = (now_utc - timedelta(days=1)).date()
@@ -288,10 +290,19 @@ def fetch_open_orders():
         return []
 
 
-def _bias_label(is_bearish) -> str:
-    if is_bearish is None:
-        return "Pending"
-    return "BEARISH (short only)" if is_bearish else "BULLISH (long only)"
+@st.cache_data(ttl=15)
+def fetch_closed_trades():
+    return journal.get_closed_trades()
+
+
+@st.cache_data(ttl=15)
+def fetch_all_trades():
+    return journal.get_all_trades()
+
+
+@st.cache_data(ttl=15)
+def fetch_boosts():
+    return journal.get_boosts()
 
 
 _TAKER_FEE_RATE = 0.0006  # ~0.06% taker fee per side, used when a real fee figure isn't available
@@ -335,10 +346,19 @@ def _compute_close_pnl(side, entry_price, size, notional, leverage,
     return exit_price, pnl_usdt, pnl_pct, fees_usdt
 
 
-def _tail_log(path: Path, n: int = 60) -> str:
+@st.cache_data(ttl=10)
+def _tail_log(path: Path, n: int = 60, max_bytes: int = 65_536) -> str:
+    """Return the last `n` lines of `path` without loading the whole file into memory."""
     if not path.exists():
         return ""
-    lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    size      = path.stat().st_size
+    read_size = min(size, max_bytes)
+    with path.open("rb") as f:
+        f.seek(size - read_size)
+        data = f.read(read_size)
+    lines = data.decode("utf-8", errors="replace").splitlines()
+    if read_size < size:
+        lines = lines[1:]   # drop a possibly-truncated first line from the seek
     return "\n".join(lines[-n:])
 
 
@@ -470,8 +490,8 @@ bot_state              = load_bot_state()
 bars, current_price    = fetch_market_data()
 balance, open_positions = fetch_account_data()
 open_orders             = fetch_open_orders()
-closed_trades           = journal.get_closed_trades()
-journal_stats           = journal.get_stats()
+closed_trades           = fetch_closed_trades()
+journal_stats           = journal.get_stats(closed_trades)
 
 # ── Auto-detect when SL/TP fires and clears the position on the exchange ──────
 _mt = st.session_state.get("manual_trade")
@@ -501,6 +521,7 @@ if _mt:
             fees_usdt  = _auto_fees,
         )
         st.session_state.manual_trade = None
+        st.cache_data.clear()
 
 open_trade    = bot_state.get("open_trade")
 pending_entry = bot_state.get("pending_entry")
@@ -857,8 +878,8 @@ def _win_rate_block(trades, group_field: str, group_values, label_fn=str) -> Non
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
-tab_dash, tab_strategy, tab_chart, tab_sim, tab_journal, tab_admin, tab_logs = st.tabs(
-    ["Dashboard", "Strategy", "Chart", "Simulation", "Journal", "Admin", "Logs"]
+tab_dash, tab_strategy, tab_chart, tab_journal, tab_admin, tab_logs = st.tabs(
+    ["Dashboard", "Strategy", "Chart", "Journal", "Admin", "Logs"]
 )
 
 
@@ -949,51 +970,7 @@ with tab_dash:
             else:
                 st.info("No closed trades yet.")
 
-    st.write("")
-
-    # ── Bot Control & System ──────────────────────────────────────────────────
-    with st.expander("⚙️  Bot Control & System", expanded=False):
-        st.markdown("**API & Account**")
-        render_api_account("dash")
-
-        st.divider()
-
-        st.markdown("**Bot Controls**")
-        render_bot_controls("dash")
-
-    # ── Live Positions & Orders ───────────────────────────────────────────────
-    with st.expander("📋  Live Positions & Orders", expanded=False):
-        st.markdown("**Live Positions**")
-        render_live_positions("dash")
-
-        st.divider()
-
-        _oh1, _oh2 = st.columns([5, 1])
-        _oh1.markdown("**Open Orders**")
-        if _oh2.button("Refresh", use_container_width=True, key="dash_refresh_orders"):
-            st.cache_data.clear()
-            st.rerun()
-        render_open_orders_list("dash")
-
-    # ── Manual Discord Alerts ─────────────────────────────────────────────────
-    with st.expander("🔔  Manual Discord Alerts", expanded=False):
-        render_discord_alerts("dash")
-
-    # ── Strategy & Risk Settings ──────────────────────────────────────────────
-    with st.expander("🛠️  Strategy & Risk Settings", expanded=False):
-        st.markdown("**Risk Parameters**")
-        st.caption("Changes update `.env` and take effect on next app restart.")
-        render_risk_params_form("dash")
-
-        st.divider()
-
-        st.markdown("**Strategy Parameters**")
-        st.caption("Position size, SL%, and ORB timers. All times in UTC. Changes saved to `.env` — restart bot to apply.")
-        render_strategy_params_form("dash")
-
-    # ── Danger Zone ────────────────────────────────────────────────────────────
-    with st.expander("⚠️  Danger Zone", expanded=False):
-        render_danger_zone("dash")
+    st.caption("Bot controls, positions, orders, settings, and the danger zone are on the **Admin** tab.")
 
 
 # ─── Tab: Strategy ─────────────────────────────────────────────────────────────
@@ -1135,62 +1112,6 @@ with tab_strategy:
             st.caption(f"Measured range (prev day 00:00 UTC → this session's open): {_pdr_pct:.3f}%")
     else:
         st.info("No active algo trade. Waiting for signal…")
-
-    st.divider()
-
-    # ── Strategy Conditions ────────────────────────────────────────────────────
-    st.markdown("### Entry A — Trading Conditions")
-
-    _cond_col1, _cond_col2 = st.columns(2)
-
-    with _cond_col1:
-        st.markdown(f"""
-**Step 1 — Build Opening Range (ORB)**
-> First 30 minutes of each session. Track the High and Low of every 1-minute bar. The ORB is the range price traded in during this window.
-
-**Step 2 — Determine Session Bias**
-> - **London:** Bearish if price at {config.SESSIONS[0].orb_start_h:02d}:{config.SESSIONS[0].orb_start_m:02d} UTC (London's ORB start) < yesterday's daily open
-> - **NY:** Bearish if price at {config.SESSIONS[1].orb_start_h:02d}:{config.SESSIONS[1].orb_start_m:02d} UTC (NY's ORB start) < price at London's ORB start
-> - Only trades aligned with the bias are taken.
-
-**Step 3 — Wait for Liquidity Sweep (Breakout)**
-> - **Bearish bias** → price sweeps **above** ORB High (liquidity grab above old high)
-> - **Bullish bias** → price sweeps **below** ORB Low (liquidity grab below old low)
-> - Invalidated if price extends **0.3%** beyond ORB boundary in the sweep direction.
-
-**Step 4 — Confirm False Breakout**
-> A 1-minute bar must **close back inside** the ORB boundary after the sweep. This confirms the move was a liquidity grab, not a true breakout.
-        """)
-
-    with _cond_col2:
-        st.markdown("""
-**Step 5 — Enter the Trade (Fade)**
-> Limit order placed slightly beyond the confirming candle's close (above it for a long, below it for a short) — not a market fill.
-> - Short (fade the sweep above ORB High)
-> - Long (fade the sweep below ORB Low)
-
-**Step 6 — Stop Loss**
-> Placed as % from entry (embedded in the order on Bitget):
-> - London: **{lon_sl:.2f}%**
-> - NY: **{ny_sl:.2f}%**
-
-**Step 7 — Take Profit (Measured Move)**
-> TP = ORB boundary ± (measured range from previous day's 00:00 UTC through this session's own open)
-> - Short: `TP = ORB Low × (1 − measured_range%)`
-> - Long: `TP = ORB High × (1 + measured_range%)`
-{pdr_line}
-
-**Entry Cutoff**
-> No new entries within **60 minutes** of session close.
-        """.format(
-            lon_sl=config.LONDON_SL_PCT * 100,
-            ny_sl=config.NY_SL_PCT * 100,
-            pdr_line=(
-                f"> Measured range: **{(bot_state.get('london_range_pct') or 0)*100:.3f}%** (London) / "
-                f"**{(bot_state.get('ny_range_pct') or 0)*100:.3f}%** (NY)"
-                if (bot_state.get("london_range_pct") or bot_state.get("ny_range_pct")) else ""
-            ),
-        ))
 
     # ── Prev day reference prices ──────────────────────────────────────────────
     if any([yest_open, price_09, price_14, prev_day_high, prev_day_low]):
@@ -1749,233 +1670,14 @@ No new entries within 60 min of session close.
             """)
 
 
-# ─── Tab: Simulation ───────────────────────────────────────────────────────────
-
-with tab_sim:
-    st.subheader("Strategy Simulator — Playback & Testing")
-    st.caption(
-        "Replays Entry A's exact live logic (ORB → breakout → confirmation → entry → SL/TP) "
-        "over a historical day, bar by bar, so you can test and watch how a trade would "
-        "have played out without touching the exchange."
-    )
-
-    _sim_c1, _sim_c2, _sim_c3 = st.columns([2, 1, 1])
-    with _sim_c1:
-        _sim_date = st.date_input(
-            "Day to simulate",
-            value=st.session_state.sim_date or datetime.now(timezone.utc).date(),
-            max_value=datetime.now(timezone.utc).date(),
-            min_value=datetime.now(timezone.utc).date() - _timedelta(days=90),
-        )
-    with _sim_c2:
-        st.write("")
-        st.write("")
-        _sim_run_clicked = st.button("▶ Run Simulation", type="primary", use_container_width=True)
-    with _sim_c3:
-        st.write("")
-        st.write("")
-        _sim_clear_clicked = st.button("Clear", use_container_width=True)
-
-    if _sim_clear_clicked:
-        st.session_state.sim_result  = None
-        st.session_state.sim_date    = None
-        st.session_state.sim_index   = 0
-        st.session_state.sim_playing = False
-        st.rerun()
-
-    if _sim_run_clicked:
-        with st.spinner(f"Fetching {_sim_date} and replaying the strategy…"):
-            _sim_feed = BitgetFeed()
-            _sim_bars = fetch_day_bars(_sim_feed, _sim_date)
-            if not _sim_bars:
-                st.error("No candle data returned for that day.")
-            else:
-                _sim_ref = fetch_reference_prices(_sim_feed, _sim_date)
-                st.session_state.sim_result = run_simulation(
-                    _sim_date, _sim_bars,
-                    _sim_ref["yesterday_open"], _sim_ref["prev_day_high"], _sim_ref["prev_day_low"],
-                )
-                st.session_state.sim_date    = _sim_date
-                st.session_state.sim_index   = 0
-                st.session_state.sim_playing = False
-                st.rerun()
-
-    _sr = st.session_state.sim_result
-    _sim_speed = 5
-
-    if _sr is None:
-        st.info("Pick a day and click **Run Simulation** to replay Entry A against real historical data.")
-    elif not _sr.snapshots:
-        st.warning("No bars available for that day.")
-    else:
-        _sim_n = len(_sr.snapshots)
-        st.session_state.sim_index = min(st.session_state.sim_index, _sim_n - 1)
-
-        _rc1, _rc2, _rc3, _rc4, _rc5 = st.columns(5)
-        _rc1.metric("Yesterday Open", f"{_sr.yesterday_open:,.2f}" if _sr.yesterday_open else "—")
-        _rc2.metric("Prev Day Range", f"{_sr.prev_day_low:,.0f}–{_sr.prev_day_high:,.0f}" if _sr.prev_day_high else "—")
-        _rc3.metric("London Bias", ("BEARISH" if _sr.london_bias else "BULLISH") if _sr.london_bias is not None else "—")
-        _rc4.metric("NY Bias",     ("BEARISH" if _sr.ny_bias     else "BULLISH") if _sr.ny_bias     is not None else "—")
-        _rc5.metric("Signals Fired", str(len(_sr.trades)))
-
-        st.divider()
-
-        # ── Playback controls ──
-        _pc1, _pc2, _pc3, _pc4 = st.columns([1, 1, 1, 4])
-        if _pc1.button("⏮ Reset", use_container_width=True):
-            st.session_state.sim_index   = 0
-            st.session_state.sim_playing = False
-            st.rerun()
-        if _pc2.button("⏸ Pause" if st.session_state.sim_playing else "▶ Play", use_container_width=True):
-            st.session_state.sim_playing = not st.session_state.sim_playing
-            st.rerun()
-        _sim_speed = _pc3.selectbox(
-            "Speed", [1, 5, 15, 60], index=1, format_func=lambda v: f"{v}x",
-            label_visibility="collapsed",
-        )
-
-        # Advance the index for this frame BEFORE the slider widget is instantiated below —
-        # Streamlit forbids mutating a key-bound widget's session_state after it renders.
-        if st.session_state.sim_playing:
-            if st.session_state.sim_index >= _sim_n - 1:
-                st.session_state.sim_playing = False
-            else:
-                st.session_state.sim_index = min(st.session_state.sim_index + _sim_speed, _sim_n - 1)
-
-        st.slider("Scrub", min_value=0, max_value=_sim_n - 1, key="sim_index", label_visibility="collapsed")
-
-        _tz_offset_sim = datetime.now().astimezone().utcoffset()
-        _snap    = _sr.snapshots[st.session_state.sim_index]
-        _cur_bar = _snap.bar
-        _pc4.markdown(
-            f"**{(_cur_bar.timestamp + _tz_offset_sim).strftime('%H:%M:%S')} local**  "
-            f"({st.session_state.sim_index + 1} / {_sim_n})"
-        )
-
-        # ── Live status panel ──
-        _st_col1, _st_col2 = st.columns(2)
-        for _lbl, _sess_snap, _col in [("London", _snap.london, _st_col1), ("NY", _snap.ny, _st_col2)]:
-            with _col:
-                with st.container(border=True):
-                    st.markdown(f"**{_lbl} Session**")
-                    _bias_txt = _bias_label(_sess_snap.bias_bearish)
-                    st.write(f"Phase: **{_sess_snap.phase.replace('_', ' ').title()}**")
-                    st.write(f"Bias: **{_bias_txt}**")
-                    if _sess_snap.orb_high and _sess_snap.orb_low:
-                        st.write(f"ORB: **{_sess_snap.orb_low:,.2f} – {_sess_snap.orb_high:,.2f}**")
-                    if _sess_snap.breakout_level:
-                        st.write(f"Breakout level: **{_sess_snap.breakout_level:,.2f}**")
-
-        if _snap.open_trade:
-            _sot = _snap.open_trade
-            _sot_live_pnl = (
-                (_cur_bar.close - _sot["entry_price"]) / _sot["entry_price"]
-                if _sot["direction"] == "long" else
-                (_sot["entry_price"] - _cur_bar.close) / _sot["entry_price"]
-            ) * 100
-            st.success(
-                f"**Trade Open** — {_sot['session']} {_sot['direction'].upper()}  |  "
-                f"Entry {_sot['entry_price']:,.2f}  SL {_sot['sl_price']:,.2f}  TP {_sot['tp_price']:,.2f}  |  "
-                f"Live {_cur_bar.close:,.2f}  ({_sot_live_pnl:+.2f}%)"
-            )
-
-        # ── Chart, bars up to the scrub point ──
-        _sim_bars_so_far = [s.bar for s in _sr.snapshots[: st.session_state.sim_index + 1]]
-        _sim_ts = [(b.timestamp + _tz_offset_sim).replace(tzinfo=None) for b in _sim_bars_so_far]
-
-        _sfig = go.Figure()
-        _sfig.add_trace(go.Candlestick(
-            x=_sim_ts,
-            open=[b.open for b in _sim_bars_so_far],
-            high=[b.high for b in _sim_bars_so_far],
-            low=[b.low for b in _sim_bars_so_far],
-            close=[b.close for b in _sim_bars_so_far],
-            name=config.SYMBOL,
-            increasing_line_color="#00cc96",
-            decreasing_line_color="#ef553b",
-        ))
-
-        for _sess_snap, _sess_color in [(_snap.london, "rgba(255,165,0,0.7)"), (_snap.ny, "rgba(138,43,226,0.7)")]:
-            if _sess_snap.orb_high and _sess_snap.orb_low:
-                _sfig.add_hline(y=_sess_snap.orb_high, line_dash="dot", line_color=_sess_color, line_width=1)
-                _sfig.add_hline(y=_sess_snap.orb_low,  line_dash="dot", line_color=_sess_color, line_width=1)
-            if _sess_snap.breakout_level:
-                _sfig.add_hline(y=_sess_snap.breakout_level, line_dash="dashdot", line_color="yellow", line_width=1,
-                                 annotation_text=f"Breakout {_sess_snap.breakout_level:,.2f}", annotation_position="right",
-                                 annotation_font=dict(color="yellow", size=9))
-
-        if _snap.open_trade:
-            _sot = _snap.open_trade
-            _sot_color = "#26a69a" if _sot["direction"] == "long" else "#ef5350"
-            _sfig.add_hline(y=_sot["entry_price"], line_color=_sot_color, line_width=2,
-                             annotation_text=f"Entry {_sot['entry_price']:,.2f}", annotation_position="right",
-                             annotation_font=dict(color=_sot_color, size=10))
-            _sfig.add_hline(y=_sot["sl_price"], line_color="#ef553b", line_width=1.5,
-                             annotation_text=f"SL {_sot['sl_price']:,.2f}", annotation_position="right",
-                             annotation_font=dict(color="#ef553b", size=9))
-            _sfig.add_hline(y=_sot["tp_price"], line_color="#00cc96", line_width=1.5,
-                             annotation_text=f"TP {_sot['tp_price']:,.2f}", annotation_position="right",
-                             annotation_font=dict(color="#00cc96", size=9))
-            _sot_in_profit = (_sot["direction"] == "long" and _cur_bar.close > _sot["entry_price"]) or \
-                             (_sot["direction"] == "short" and _cur_bar.close < _sot["entry_price"])
-            _sfig.add_hrect(
-                y0=min(_sot["entry_price"], _cur_bar.close), y1=max(_sot["entry_price"], _cur_bar.close),
-                fillcolor="rgba(0,204,150,0.08)" if _sot_in_profit else "rgba(239,85,59,0.08)", line_width=0,
-            )
-
-        _sfig.update_layout(
-            height=520,
-            xaxis=dict(title=f"Time (UTC{int(_tz_offset_sim.total_seconds()//3600):+d})", type="date"),
-            xaxis_rangeslider_visible=False,
-            margin=dict(l=10, r=10, t=10, b=10),
-        )
-        st.plotly_chart(_sfig, use_container_width=True)
-
-        # ── Event log up to the scrub point ──
-        with st.expander("Event log", expanded=False):
-            _sim_events = []
-            for _s in _sr.snapshots[: st.session_state.sim_index + 1]:
-                for _e in _s.events:
-                    _t = (_s.bar.timestamp + _tz_offset_sim).strftime("%H:%M")
-                    _sim_events.append(f"`{_t}`  {_e}")
-            if _sim_events:
-                st.markdown("  \n".join(_sim_events[-60:]))
-            else:
-                st.caption("No phase transitions or signals yet at this point in the day.")
-
-        # ── Trade summary ──
-        if _sr.trades:
-            st.markdown("#### Signals fired today")
-            _sim_rows = [{
-                "Session":    _t.session,
-                "Direction":  _t.direction.upper(),
-                "Entry Time": (_t.entry_time + _tz_offset_sim).strftime("%H:%M"),
-                "Entry":      round(_t.entry_price, 2),
-                "SL":         round(_t.sl_price, 2),
-                "TP":         round(_t.tp_price, 2),
-                "Result":     _t.result.replace("_", " ").title(),
-                "Exit Time":  (_t.exit_time + _tz_offset_sim).strftime("%H:%M") if _t.exit_time else "—",
-                "P&L %":      f"{_t.pnl_pct:+.2f}%" if _t.pnl_pct is not None else "—",
-            } for _t in _sr.trades]
-            st.dataframe(pd.DataFrame(_sim_rows), use_container_width=True, hide_index=True)
-        else:
-            st.caption("No signals fired on this day (bias may not align with a sweep, or no breakout occurred).")
-
-    # ── Auto-play driver — this frame already rendered at the advanced index above;
-    #    just pace and trigger the next frame. Index mutation happens pre-slider, not here.
-    if st.session_state.sim_playing:
-        time.sleep(0.2)
-        st.rerun()
-
-
 # ─── Tab: Journal ──────────────────────────────────────────────────────────────
 
 with tab_journal:
     st.subheader("Trading Journal")
 
-    all_trades    = journal.get_all_trades()
+    all_trades    = fetch_all_trades()
     stats         = journal_stats
-    boosts        = journal.get_boosts()
+    boosts        = fetch_boosts()
 
     # ── Stats cards ────────────────────────────────────────────────────────────
     s1, s2, s3, s4, s5, s6 = st.columns(6)
@@ -2104,10 +1806,12 @@ with tab_journal:
         col_save, col_del = st.columns([3, 1])
         if col_save.button("Save Notes"):
             journal.update_notes(selected_id, note_text)
+            st.cache_data.clear()
             st.success("Notes saved.")
             st.rerun()
         if col_del.button("Delete Trade", type="secondary"):
             journal.delete_trade(selected_id)
+            st.cache_data.clear()
             st.warning("Trade deleted from journal.")
             st.rerun()
 
@@ -2119,6 +1823,7 @@ with tab_journal:
         if st.button("Reset Journal", type="primary"):
             if _confirm == "RESET":
                 journal.reset_journal()
+                st.cache_data.clear()
                 st.success("Journal cleared.")
                 st.rerun()
             else:
@@ -2320,5 +2025,4 @@ with tab_logs:
 
 if auto_refresh:
     time.sleep(refresh_secs)
-    st.cache_data.clear()
     st.rerun()

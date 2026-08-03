@@ -44,6 +44,14 @@ def init_db() -> None:
             )
         """)
         conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trades_status_entry
+            ON trades(status, entry_time)
+        """)
+        conn.execute("""
+            CREATE INDEX IF NOT EXISTS idx_trades_exit_time
+            ON trades(exit_time)
+        """)
+        conn.execute("""
             CREATE TABLE IF NOT EXISTS position_boosts (
                 id                  INTEGER PRIMARY KEY AUTOINCREMENT,
                 date                TEXT    NOT NULL,
@@ -218,8 +226,8 @@ def reset_journal() -> None:
         conn.commit()
 
 
-def get_stats() -> dict:
-    closed = get_closed_trades()
+def get_stats(closed: Optional[list[dict]] = None) -> dict:
+    closed = get_closed_trades() if closed is None else closed
     empty = {
         "total_trades": 0, "wins": 0, "losses": 0, "win_rate": 0.0,
         "total_pnl": 0.0, "avg_win": 0.0, "avg_loss": 0.0,
