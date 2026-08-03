@@ -32,6 +32,3 @@ discord_bot/data/
 # OS
 .DS_Store
 Thumbs.db
-
-# Docker
-.dockerignore

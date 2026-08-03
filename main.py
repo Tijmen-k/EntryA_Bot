@@ -1,5 +1,5 @@
 """
-Entry A — Kraken Futures Trading Bot
+Entry A — Bitget Futures Trading Bot
 ======================================
 Runs the Entry A liquidity-sweep fade strategy on PF_ETHUSD (or configured symbol).
 

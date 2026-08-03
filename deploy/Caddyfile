@@ -1,0 +1,15 @@
+# Copy to /etc/caddy/Caddyfile on the VPS and replace the domain below.
+# Caddy handles automatic Let's Encrypt TLS — no manual cert management needed.
+
+your-domain.example.com {
+    reverse_proxy 127.0.0.1:8501
+
+    encode gzip
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        Referrer-Policy "strict-origin-when-cross-origin"
+    }
+}

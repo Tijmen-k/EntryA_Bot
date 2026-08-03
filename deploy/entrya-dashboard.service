@@ -1,0 +1,20 @@
+# Template systemd unit for the Streamlit dashboard.
+# Copy to /etc/systemd/system/entrya-dashboard.service on the VPS, adjust
+# User/WorkingDirectory/ExecStart for your actual deploy path and venv, then:
+#   systemctl daemon-reload
+#   systemctl enable --now entrya-dashboard
+
+[Unit]
+Description=EntryA-Bot Streamlit Dashboard
+After=network.target
+
+[Service]
+Type=simple
+User=entrya
+WorkingDirectory=/opt/entry-a-bot
+ExecStart=/opt/entry-a-bot/.venv/bin/streamlit run app.py
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

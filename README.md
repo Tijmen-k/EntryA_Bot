@@ -1,6 +1,6 @@
-# Entry A — Kraken Futures Trading Bot
+# Entry A — Bitget Futures Trading Bot
 
-Algorithmic implementation of the **Entry A** liquidity-sweep fade strategy on Kraken Futures (`PF_ETHUSD`).
+Algorithmic implementation of the **Entry A** liquidity-sweep fade strategy on Bitget Futures (`ETHUSD`).
 
 ## Quick start
 
@@ -9,13 +9,13 @@ Algorithmic implementation of the **Entry A** liquidity-sweep fade strategy on K
 git clone https://github.com/YOUR_USERNAME/entry-a-bot.git
 cd entry-a-bot
 cp .env.example .env
-# Edit .env — add your Kraken API keys and set TRADING_MODE=demo
+# Edit .env — add your Bitget API keys and set TRADING_MODE=demo
 ```
 
-### 2. Get Kraken demo credentials
-- Register at https://demo-futures.kraken.com
-- Create an API key under Settings → API (needs: Trading + Account permissions)
-- Paste key and secret into `.env`
+### 2. Get Bitget demo credentials
+- Register at https://www.bitget.com → Demo Trading → API Management
+- Create an API key (needs: Trading + Account permissions)
+- Paste the key, secret, and passphrase into `.env`
 
 ### 3. Run locally (Python)
 ```bash
@@ -46,10 +46,10 @@ All settings live in `.env` (copy from `.env.example`):
 
 | Variable | Default | Description |
 |---|---|---|
-| `TRADING_MODE` | `demo` | `demo` or `live` |
-| `KRAKEN_API_KEY` | — | From Kraken Futures account |
-| `KRAKEN_API_SECRET` | — | From Kraken Futures account |
-| `SYMBOL` | `PF_ETHUSD` | Instrument (linear ETH perpetual) |
+| `TRADING_MODE` | `demo` | `demo` or `live` — selects the matching `BITGET_DEMO_*`/`BITGET_LIVE_*` key set |
+| `BITGET_DEMO_API_KEY` / `_SECRET` / `_PASSPHRASE` | — | From Bitget demo trading account |
+| `BITGET_LIVE_API_KEY` / `_SECRET` / `_PASSPHRASE` | — | From Bitget live account |
+| `SYMBOL` | `ETHUSD` | Instrument (coin-M inverse perpetual) |
 | `RISK_PER_TRADE_PCT` | `0.01` | 1% of account balance per trade |
 | `LEVERAGE` | `5.0` | Position leverage (5x recommended to start) |
 | `DRY_RUN` | `false` | `true` = no real orders |
@@ -62,8 +62,8 @@ entry-a-bot/
 ├── main.py              # Bot orchestrator & main loop
 ├── config.py            # All configuration (reads .env)
 ├── src/
-│   ├── data/feed.py     # Kraken public REST — OHLCV & ticker
-│   ├── broker/kraken.py # Authenticated REST — orders, positions, account
+│   ├── data/feed.py     # Bitget public REST — OHLCV & ticker
+│   ├── broker/bitget.py # Authenticated REST — orders, positions, account
 │   ├── strategy/entry_a.py  # Entry A state machine + bias calculator
 │   ├── risk/sizing.py   # Risk-based position sizing
 │   └── utils/logger.py  # Loguru setup with file rotation

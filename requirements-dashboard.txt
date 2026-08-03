@@ -1,0 +1,9 @@
+# Deps for the Streamlit dashboard (app.py). Includes the engine set since
+# the dashboard imports config/src modules directly.
+requests==2.32.3
+python-dotenv==1.0.1
+loguru==0.7.2
+streamlit>=1.35.0
+plotly>=5.22.0
+pandas>=2.0.0
+psutil>=6.0.0

@@ -155,7 +155,3 @@ def _maybe_float(v) -> Optional[float]:
         return float(v) if v is not None and v != "" else None
     except (TypeError, ValueError):
         return None
-
-
-# ── Backward-compatible alias ──
-KrakenFeed = BitgetFeed

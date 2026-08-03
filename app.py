@@ -2,19 +2,17 @@
 Streamlit dashboard for the Entry A Bitget Futures bot.
 Run with:  streamlit run app.py
 """
+import hashlib
+import hmac
 import json
 import os
 import subprocess
-import sys
 import time
-from datetime import datetime, timezone, time as _dt_time, date as _date, timedelta as _timedelta
+from datetime import datetime, timezone, time as _dt_time, timedelta as _timedelta
 from pathlib import Path
-from typing import Optional
 
 import pandas as pd
-import psutil
 import plotly.graph_objects as go
-from plotly.subplots import make_subplots
 import streamlit as st
 from dotenv import set_key
 
@@ -27,10 +25,8 @@ from src.data.feed import BitgetFeed
 from src.broker.bitget import BitgetBroker
 from src.journal import db as journal
 from src.notifications.discord import DiscordNotifier
-from src.risk.sizing import (
-    SCALING_LADDER, get_current_rung, get_next_rung,
-    get_ladder_progress, get_active_position_usdt, boost_streak_info,
-)
+from src.utils import process_control
+from src.risk.sizing import SCALING_LADDER, get_ladder_progress, boost_streak_info
 from src.backtest.simulator import fetch_day_bars, fetch_reference_prices, run_simulation
 
 _notifier = DiscordNotifier(config.DISCORD_WEBHOOK_URL)
@@ -52,6 +48,72 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="collapsed",
 )
+
+# ── Login gate ───────────────────────────────────────────────────────────────
+# Credential is a salted PBKDF2 hash in .env (never plaintext) — generate with
+# scripts/generate_login_secret.py. Must match _PBKDF2_ITERATIONS there.
+_PBKDF2_ITERATIONS = 200_000
+_MAX_LOGIN_ATTEMPTS = 5
+_LOCKOUT_SECONDS = 60
+
+
+def _verify_password(candidate: str) -> bool:
+    salt = os.getenv("DASHBOARD_PASSWORD_SALT", "")
+    expected_hash = os.getenv("DASHBOARD_PASSWORD_HASH", "")
+    if not salt or not expected_hash:
+        return False
+    candidate_hash = hashlib.pbkdf2_hmac(
+        "sha256", candidate.encode(), bytes.fromhex(salt), _PBKDF2_ITERATIONS
+    ).hex()
+    return hmac.compare_digest(candidate_hash, expected_hash)
+
+
+def _require_auth() -> None:
+    st.session_state.setdefault("authenticated", False)
+    st.session_state.setdefault("login_attempts", 0)
+    st.session_state.setdefault("lockout_until", 0.0)
+
+    if st.session_state.authenticated:
+        return
+
+    if not os.getenv("DASHBOARD_PASSWORD_HASH"):
+        st.error(
+            "DASHBOARD_PASSWORD_HASH / DASHBOARD_PASSWORD_SALT are not set in "
+            ".env. Run `python scripts/generate_login_secret.py` and paste the "
+            "output into .env before running this dashboard."
+        )
+        st.stop()
+
+    st.markdown("## 🔒 EntryA-Bot — Sign in")
+
+    # Per-session lockout only — a UX speed bump against casual guessing, not
+    # real rate-limiting. The actual protection is the reverse proxy + firewall
+    # in front of this app (see DEPLOYMENT.md).
+    remaining = st.session_state.lockout_until - time.time()
+    if remaining > 0:
+        st.warning(f"Too many failed attempts. Try again in {int(remaining)}s.")
+        st.stop()
+
+    with st.form("login_form"):
+        pw = st.text_input("Password", type="password")
+        submitted = st.form_submit_button("Sign in", type="primary")
+
+    if submitted:
+        if _verify_password(pw):
+            st.session_state.authenticated = True
+            st.session_state.login_attempts = 0
+            st.rerun()
+        else:
+            st.session_state.login_attempts += 1
+            if st.session_state.login_attempts >= _MAX_LOGIN_ATTEMPTS:
+                st.session_state.lockout_until = time.time() + _LOCKOUT_SECONDS
+                st.session_state.login_attempts = 0
+            st.error("Incorrect password.")
+
+    st.stop()
+
+
+_require_auth()
 
 # ── Global styling ─────────────────────────────────────────────────────────────
 
@@ -122,50 +184,25 @@ def load_bot_state() -> dict:
 _PROJECT_DIR = str(Path(__file__).resolve().parent)
 
 
-def _is_project_bot_process(proc: "psutil.Process") -> bool:
-    try:
-        cmdline = proc.cmdline()
-    except (psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
-        return False
-    if not any(part.endswith("main.py") for part in cmdline):
-        return False
-    try:
-        return os.path.normcase(proc.cwd()) == os.path.normcase(_PROJECT_DIR)
-    except (psutil.NoSuchProcess, psutil.AccessDenied):
-        return True  # cmdline matched but cwd unreadable — err on the side of flagging it
-
-
-def _find_external_bot_pid() -> Optional[int]:
-    """
-    A `python main.py` process for this project that this Streamlit session didn't
-    launch itself. session_state (and any subprocess handle it holds) is wiped every
-    time the Streamlit server restarts, so without this check a freshly reloaded
-    dashboard would show "STOPPED" and let Start Bot spawn a second, duplicate live
-    bot on top of one already running (from a terminal, or an earlier session).
-    """
-    own_pid = st.session_state.bot_proc.pid if st.session_state.bot_proc else None
-    for proc in psutil.process_iter(["pid"]):
-        if proc.info["pid"] in (own_pid, os.getpid()):
-            continue
-        if _is_project_bot_process(proc):
-            return proc.info["pid"]
-    return None
-
-
 def bot_is_running() -> bool:
+    """
+    True if this session launched the bot and it's still alive, or if a
+    `python main.py` process for this project is running externally (started
+    from a terminal, or by a prior Streamlit session that has since
+    restarted — session_state is wiped on every server restart, so without
+    this fallback a freshly reloaded dashboard would show "STOPPED" and let
+    Start Bot spawn a second, duplicate live bot on top of one already running).
+    """
     proc = st.session_state.bot_proc
     if proc is not None and proc.poll() is None:
         return True
-    return _find_external_bot_pid() is not None
+    return process_control.find_bot_pid(_PROJECT_DIR) is not None
 
 
 def start_bot(dry_run: bool) -> None:
     if bot_is_running():
         return
-    args = [sys.executable, "main.py"]
-    if dry_run:
-        args.append("--dry-run")
-    st.session_state.bot_proc = subprocess.Popen(args, cwd=_PROJECT_DIR)
+    st.session_state.bot_proc = process_control.start(_PROJECT_DIR, dry_run=dry_run)
 
 
 def stop_bot() -> None:
@@ -181,16 +218,7 @@ def stop_bot() -> None:
 
     # No subprocess handle in this session (e.g. started elsewhere, or a prior
     # session that has since restarted) — fall back to killing it by PID.
-    pid = _find_external_bot_pid()
-    if pid:
-        try:
-            ext = psutil.Process(pid)
-            ext.terminate()
-            ext.wait(timeout=5)
-        except psutil.TimeoutExpired:
-            ext.kill()
-        except psutil.NoSuchProcess:
-            pass
+    process_control.stop(_PROJECT_DIR)
     st.session_state.bot_proc = None
 
 
@@ -252,10 +280,59 @@ def fetch_account_data():
         return 0.0, []
 
 
+@st.cache_data(ttl=30)
+def fetch_open_orders():
+    try:
+        return BitgetBroker().get_open_orders()
+    except Exception:
+        return []
+
+
 def _bias_label(is_bearish) -> str:
     if is_bearish is None:
         return "Pending"
     return "BEARISH (short only)" if is_bearish else "BULLISH (long only)"
+
+
+_TAKER_FEE_RATE = 0.0006  # ~0.06% taker fee per side, used when a real fee figure isn't available
+
+
+def _compute_close_pnl(side, entry_price, size, notional, leverage,
+                        sl_price, tp_price, current_price, broker=None):
+    """
+    Compute realized P&L for a position that has already closed on the exchange.
+    Prefers the broker's own closed-position history (most accurate); falls back
+    to estimating the exit price from the stored SL/TP levels (whichever the live
+    price has crossed), and finally to the current price if neither is set.
+    Pass an existing `broker` to reuse one (e.g. right after using it to close
+    the position); otherwise a fresh one is constructed. Construction and the
+    history lookup are both covered by the same fallback — any failure just
+    means we use the SL/TP estimate instead of erroring out.
+    Returns (exit_price, pnl_usdt, pnl_pct, fees_usdt).
+    """
+    try:
+        broker   = broker or BitgetBroker()
+        pos_data = broker.get_closed_position_data(side)
+    except Exception:
+        pos_data = None
+
+    if pos_data is not None:
+        exit_price = pos_data["exit_price"] or current_price or entry_price
+        pnl_usdt   = pos_data["net_pnl"]
+        fees_usdt  = pos_data["fees"]
+    else:
+        live = current_price or entry_price
+        if side == "long":
+            exit_price = sl_price if (live < entry_price and sl_price) else (tp_price or live)
+            pnl_usdt   = (exit_price - entry_price) * size
+        else:
+            exit_price = sl_price if (live > entry_price and sl_price) else (tp_price or live)
+            pnl_usdt   = (entry_price - exit_price) * size
+        fees_usdt = (notional or 0) * _TAKER_FEE_RATE
+
+    margin  = (notional or 1) / max(leverage, 1)
+    pnl_pct = pnl_usdt / margin * 100
+    return exit_price, pnl_usdt, pnl_pct, fees_usdt
 
 
 def _tail_log(path: Path, n: int = 60) -> str:
@@ -339,7 +416,7 @@ with _htitle:
 
 with st.container():
     st.markdown('<div id="entrya-topbar">', unsafe_allow_html=True)
-    hc1, hc2, hc3, hc4, hc5, hc6 = st.columns([1, 1.6, 1.1, 1.3, 1, 1.3])
+    hc1, hc2, hc3, hc4, hc5, hc6, hc7 = st.columns([1, 1.6, 1.1, 1.3, 1, 1.3, 0.8])
 
     with hc1:
         dry_run = st.toggle("Dry Run", value=st.session_state.dry_run)
@@ -375,6 +452,11 @@ with st.container():
             st.cache_data.clear()
             st.rerun()
 
+    with hc7:
+        if st.button("Log out", use_container_width=True, key="topbar_logout"):
+            st.session_state.authenticated = False
+            st.rerun()
+
     st.caption(f"Updated {datetime.now(tz=timezone.utc).strftime('%H:%M:%S')} UTC"
                + ("  ·  Started outside this dashboard session — Stop Bot still works." if running and _is_external else ""))
     st.markdown('</div>', unsafe_allow_html=True)
@@ -387,6 +469,9 @@ st.write("")
 bot_state              = load_bot_state()
 bars, current_price    = fetch_market_data()
 balance, open_positions = fetch_account_data()
+open_orders             = fetch_open_orders()
+closed_trades           = journal.get_closed_trades()
+journal_stats           = journal.get_stats()
 
 # ── Auto-detect when SL/TP fires and clears the position on the exchange ──────
 _mt = st.session_state.get("manual_trade")
@@ -403,31 +488,11 @@ if _mt:
         _notional = _mt.get("notional_usdt", 0)
         _sl_price = _mt.get("sl_price")
         _tp_price = _mt.get("tp_price")
-        _live     = current_price or _m_entry
 
-        # Fetch actual P&L from Bitget history (most accurate)
-        try:
-            _broker_hist  = BitgetBroker()
-            _pos_data     = _broker_hist.get_closed_position_data(_expected_side)
-        except Exception:
-            _pos_data = None
-
-        if _pos_data is not None:
-            _auto_pnl_usdt = _pos_data["net_pnl"]
-            _auto_fees     = _pos_data["fees"]
-            _exit_price    = _pos_data["exit_price"] or _live
-        else:
-            # Fallback: estimate from stored SL/TP prices
-            if _expected_side == "long":
-                _exit_price = _sl_price if (_live < _m_entry and _sl_price) else (_tp_price or _live)
-                _auto_pnl_usdt = (_exit_price - _m_entry) * _m_size
-            else:
-                _exit_price = _sl_price if (_live > _m_entry and _sl_price) else (_tp_price or _live)
-                _auto_pnl_usdt = (_m_entry - _exit_price) * _m_size
-            _auto_fees = (_notional or 0) * 0.0006  # ~0.06% taker per side
-
-        _margin = (_notional or 1) / max(_m_lev, 1)
-        _auto_pnl_pct = _auto_pnl_usdt / _margin * 100
+        _exit_price, _auto_pnl_usdt, _auto_pnl_pct, _auto_fees = _compute_close_pnl(
+            _expected_side, _m_entry, _m_size, _notional, _m_lev,
+            _sl_price, _tp_price, current_price,
+        )
         journal.close_trade(
             trade_id   = _mt.get("trade_id", "unknown"),
             exit_price = _exit_price,
@@ -473,6 +538,323 @@ _ny_orb_l      = bot_state.get("ny_orb_low")
 _ny_brk        = bot_state.get("ny_breakout_level")
 
 
+# ── Shared tab-section renderers ────────────────────────────────────────────────
+# The Dashboard and Admin tabs render the same underlying sections (just under
+# different headers/wrapping — expanders on Dashboard, flat sections on Admin).
+# Each function below is shared by both call sites; `prefix` keeps widget keys
+# unique per tab.
+
+def render_api_account(prefix: str) -> None:
+    _a1, _a2, _a3, _a4 = st.columns(4)
+    _a1.metric("Mode",    config.TRADING_MODE.upper())
+    _a2.metric("Symbol",  config.SYMBOL)
+    _a3.metric("Balance", f"${balance:,.2f} USDT" if balance else "—")
+    _a4.metric("Open Positions", len(open_positions))
+
+    _tc1, _tc2 = st.columns(2)
+    if _tc1.button("Test API Connection", key=f"{prefix}_test_api_btn"):
+        with st.spinner("Connecting…"):
+            try:
+                _test_broker = BitgetBroker()
+                _test_bal    = _test_broker.get_account_balance()
+                st.success(f"Connected. Available balance: **${_test_bal:,.2f} USDT**")
+            except Exception as exc:
+                st.error(f"Connection failed: {exc}")
+
+    if _tc2.button("Test Discord Webhook", key=f"{prefix}_test_discord_btn"):
+        if not config.DISCORD_WEBHOOK_URL:
+            st.error("DISCORD_WEBHOOK_URL is not set in .env")
+        else:
+            with st.spinner("Sending test message…"):
+                import requests as _req
+                _r = _req.post(
+                    config.DISCORD_WEBHOOK_URL,
+                    json={"content": f"✅ **EntryA-Bot** — webhook test from dashboard ({config.SYMBOL} | {config.TRADING_MODE.upper()})"},
+                    timeout=10,
+                )
+                if _r.status_code in (200, 204):
+                    st.success("Test message sent to Discord.")
+                else:
+                    st.error(f"Webhook returned {_r.status_code}: {_r.text[:200]}")
+
+
+def render_bot_controls(prefix: str) -> None:
+    bc1, bc2, bc3 = st.columns(3)
+    _running = bot_is_running()
+    bc1.metric("Bot Status", "RUNNING" if _running else "STOPPED")
+    bc2.metric("Mode", "DRY RUN" if st.session_state.dry_run else "LIVE")
+    _pid_display = st.session_state.bot_proc.pid if st.session_state.bot_proc else process_control.find_bot_pid(_PROJECT_DIR)
+    bc3.metric("PID", str(_pid_display) if _running and _pid_display else "—")
+
+    ab1, ab2, ab3 = st.columns(3)
+    if ab1.button("Start Bot (Live)", disabled=_running, use_container_width=True, type="primary", key=f"{prefix}_start_live"):
+        start_bot(dry_run=False)
+        st.rerun()
+    if ab2.button("Start Bot (Dry Run)", disabled=_running, use_container_width=True, key=f"{prefix}_start_dry"):
+        start_bot(dry_run=True)
+        st.rerun()
+    if ab3.button("Stop Bot", disabled=not _running, use_container_width=True, type="secondary", key=f"{prefix}_stop_bot"):
+        stop_bot()
+        st.rerun()
+
+
+def render_discord_alerts(prefix: str) -> None:
+    st.caption("Use these when you enter or exit a trade manually on Bitget.")
+
+    with st.form(f"discord_manual_entry_{prefix}"):
+        st.markdown("**Manual Trade Entry Alert**")
+        _mn1, _mn2, _mn3 = st.columns(3)
+        _mn_session   = _mn1.selectbox("Session", ["London", "NY"], key=f"{prefix}_mn_session")
+        _mn_direction = _mn2.selectbox("Direction", ["long", "short"], key=f"{prefix}_mn_direction")
+        _mn_entry     = _mn3.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key=f"{prefix}_mn_entry")
+        _mn4, _mn5, _mn6 = st.columns(3)
+        _mn_sl        = _mn4.number_input("SL Price",    min_value=0.01, value=float(current_price or 0) * 0.99, format="%.2f", key=f"{prefix}_mn_sl")
+        _mn_tp        = _mn5.number_input("TP Price",    min_value=0.01, value=float(current_price or 0) * 1.01, format="%.2f", key=f"{prefix}_mn_tp")
+        _mn_size      = _mn6.number_input("Size (USDT)", min_value=1.0,  value=float(config.ALGO_POSITION_USDT), format="%.0f", key=f"{prefix}_mn_size")
+        if st.form_submit_button("Send Entry Alert", type="primary"):
+            _ok = _notifier.trade_entry(
+                session=_mn_session,
+                direction=_mn_direction,
+                entry_price=_mn_entry,
+                sl_price=_mn_sl,
+                tp_price=_mn_tp,
+                contracts=round(_mn_size * config.LEVERAGE / _mn_entry / config.CONTRACT_SIZE) * config.CONTRACT_SIZE,
+                usdt_size=_mn_size,
+                entry_id="manual",
+            )
+            if _ok:
+                st.success("Entry alert sent to Discord.")
+            else:
+                st.error("Discord send failed — check the webhook URL in .env and the app logs.")
+
+    with st.form(f"discord_manual_close_{prefix}"):
+        st.markdown("**Manual Trade Close Alert**")
+        _mc1, _mc2, _mc3 = st.columns(3)
+        _mc_session   = _mc1.selectbox("Session", ["London", "NY"], key=f"{prefix}_mc_sess")
+        _mc_direction = _mc2.selectbox("Direction", ["long", "short"], key=f"{prefix}_mc_dir")
+        _mc_result    = _mc3.selectbox("Result", ["tp_hit", "sl_hit"], key=f"{prefix}_mc_result")
+        _mc4, _mc5, _mc6 = st.columns(3)
+        _mc_entry     = _mc4.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key=f"{prefix}_mc_entry")
+        _mc_exit      = _mc5.number_input("Exit Price",  min_value=0.01, value=float(current_price or 0), format="%.2f", key=f"{prefix}_mc_exit")
+        _mc_pnl       = _mc6.number_input("P&L (USDT)",  value=0.0, format="%.2f", key=f"{prefix}_mc_pnl")
+        if st.form_submit_button("Send Close Alert", type="primary"):
+            _ok = _notifier.trade_closed(
+                result=_mc_result,
+                session=_mc_session,
+                direction=_mc_direction,
+                entry_price=_mc_entry,
+                exit_price=_mc_exit,
+                pnl_usdt=_mc_pnl,
+                pnl_pct=0.0,
+                daily_pnl_pct=float(daily_pnl or 0),
+            )
+            if _ok:
+                st.success("Close alert sent to Discord.")
+            else:
+                st.error("Discord send failed — check the webhook URL in .env and the app logs.")
+
+
+def render_risk_params_form(prefix: str) -> None:
+    with st.form(f"risk_params_{prefix}"):
+        rp1, rp2, rp3, rp4 = st.columns(4)
+        new_leverage = rp1.number_input(
+            "Leverage", min_value=1, max_value=125,
+            value=int(config.LEVERAGE), step=1, key=f"{prefix}_leverage",
+        )
+        new_risk = rp2.number_input(
+            "Risk per Trade (%)", min_value=0.1, max_value=10.0,
+            value=config.RISK_PER_TRADE_PCT * 100, step=0.1, format="%.1f", key=f"{prefix}_risk_pct",
+        )
+        new_symbol = rp3.text_input("Symbol", value=config.SYMBOL, key=f"{prefix}_symbol")
+        new_mode   = rp4.selectbox(
+            "Trading Mode", ["demo", "live"],
+            index=0 if config.TRADING_MODE == "demo" else 1, key=f"{prefix}_trading_mode",
+        )
+
+        # Streamlit reruns the whole script on the selectbox change, so this
+        # checkbox is already rendered by the time the deferred
+        # form_submit_button below actually fires.
+        _confirm_live = True
+        if new_mode == "live" and config.TRADING_MODE != "live":
+            _confirm_live = st.checkbox(
+                "Confirm switch to LIVE trading (real funds, real orders)",
+                key=f"{prefix}_confirm_live",
+            )
+
+        if st.form_submit_button("Save Settings", type="primary"):
+            _update_env("LEVERAGE",           str(new_leverage))
+            _update_env("RISK_PER_TRADE_PCT", str(new_risk / 100))
+            _update_env("SYMBOL",             new_symbol)
+            if new_mode == "live" and config.TRADING_MODE != "live" and not _confirm_live:
+                st.warning("Trading mode NOT changed — check the confirmation box to switch to live.")
+            else:
+                _update_env("TRADING_MODE", new_mode)
+            st.success("Settings saved to `.env`. Restart the app to apply.")
+
+
+def render_strategy_params_form(prefix: str) -> None:
+    with st.form(f"strategy_params_{prefix}"):
+        _sp1, _sp2, _sp3 = st.columns(3)
+        _new_algo_size = _sp1.number_input(
+            "Algo Position Size (USDT)", min_value=1.0, max_value=100_000.0,
+            value=float(config.ALGO_POSITION_USDT), step=10.0, format="%.0f",
+            help="Fixed USDT margin per algo trade (uses configured leverage). Set 0 to use risk-% sizing.",
+            key=f"{prefix}_algo_size",
+        )
+        _new_london_sl = _sp2.number_input(
+            "London SL %", min_value=0.05, max_value=5.0,
+            value=config.LONDON_SL_PCT * 100, step=0.05, format="%.2f", key=f"{prefix}_london_sl",
+        )
+        _new_ny_sl = _sp3.number_input(
+            "NY SL %", min_value=0.05, max_value=5.0,
+            value=config.NY_SL_PCT * 100, step=0.05, format="%.2f", key=f"{prefix}_ny_sl",
+        )
+
+        st.markdown("**ORB Window — London (UTC)**")
+        _ol1, _ol2, _ol3, _ol4 = st.columns(4)
+        _new_lon_sh = _ol1.number_input("Start Hour",  0, 23, config.SESSIONS[0].orb_start_h, key=f"{prefix}_lon_sh")
+        _new_lon_sm = _ol2.number_input("Start Min",   0, 59, config.SESSIONS[0].orb_start_m, key=f"{prefix}_lon_sm")
+        _new_lon_eh = _ol3.number_input("End Hour",    0, 23, config.SESSIONS[0].orb_end_h,   key=f"{prefix}_lon_eh")
+        _new_lon_em = _ol4.number_input("End Min",     0, 59, config.SESSIONS[0].orb_end_m,   key=f"{prefix}_lon_em")
+
+        st.markdown("**ORB Window — NY (UTC)**")
+        _on1, _on2, _on3, _on4 = st.columns(4)
+        _new_ny_sh  = _on1.number_input("Start Hour",  0, 23, config.SESSIONS[1].orb_start_h, key=f"{prefix}_ny_sh")
+        _new_ny_sm  = _on2.number_input("Start Min",   0, 59, config.SESSIONS[1].orb_start_m, key=f"{prefix}_ny_sm")
+        _new_ny_eh  = _on3.number_input("End Hour",    0, 23, config.SESSIONS[1].orb_end_h,   key=f"{prefix}_ny_eh")
+        _new_ny_em  = _on4.number_input("End Min",     0, 59, config.SESSIONS[1].orb_end_m,   key=f"{prefix}_ny_em")
+
+        if st.form_submit_button("Save Strategy Settings", type="primary"):
+            _update_env("ALGO_POSITION_USDT",  str(int(_new_algo_size)))
+            _update_env("LONDON_SL_PCT",       f"{_new_london_sl / 100:.4f}")
+            _update_env("NY_SL_PCT",           f"{_new_ny_sl / 100:.4f}")
+            _update_env("LONDON_ORB_START_H",  str(_new_lon_sh))
+            _update_env("LONDON_ORB_START_M",  str(_new_lon_sm))
+            _update_env("LONDON_ORB_END_H",    str(_new_lon_eh))
+            _update_env("LONDON_ORB_END_M",    str(_new_lon_em))
+            _update_env("NY_ORB_START_H",      str(_new_ny_sh))
+            _update_env("NY_ORB_START_M",      str(_new_ny_sm))
+            _update_env("NY_ORB_END_H",        str(_new_ny_eh))
+            _update_env("NY_ORB_END_M",        str(_new_ny_em))
+            st.success("Strategy settings saved. Restart the app and bot to apply.")
+
+
+def render_live_positions(prefix: str) -> None:
+    if open_positions:
+        for pos in open_positions:
+            with st.container(border=True):
+                pc1, pc2, pc3, pc4, pc5 = st.columns([2, 2, 2, 2, 1])
+                pc1.write(f"**{pos.symbol}** — {'LONG' if pos.side=='long' else 'SHORT'}")
+                pc2.write(f"Size: `{pos.size:.5f}` {_BASE_CCY}")
+                pc3.write(f"Entry: `{pos.entry_price:,.4f}`")
+                pc4.write(f"uPnL: `{pos.unrealised_pnl:+,.4f}` USDT")
+                if pc5.button("Close", key=f"{prefix}_close_pos_{pos.symbol}_{pos.side}"):
+                    _cp_ok = False
+                    with st.spinner("Closing…"):
+                        try:
+                            _cb = BitgetBroker()
+                            _cb.close_position(pos)
+                            # Cancel any leftover SL/TP trigger orders for this
+                            # symbol — Bitget doesn't always auto-cancel them
+                            # when a position is closed this way, and since this
+                            # bot only ever holds one position at a time, a
+                            # blanket cancel here is safe.
+                            try:
+                                _cb.cancel_all_orders()
+                            except Exception:
+                                pass
+                            st.cache_data.clear()
+                            _cp_ok = True
+                        except Exception as exc:
+                            st.error(str(exc))
+                    if _cp_ok:
+                        st.success("Position closed.")
+                        st.rerun()
+    else:
+        st.info("No open positions on the exchange.")
+
+
+def render_open_orders_list(prefix: str) -> None:
+    if open_orders:
+        for ord_ in open_orders:
+            with st.container(border=True):
+                oc1, oc2, oc3, oc4, oc5 = st.columns([2, 2, 2, 2, 1])
+                oc1.write(f"**{ord_.symbol}**")
+                oc2.write(f"{ord_.order_type.upper()} — {ord_.side.upper()}")
+                oc3.write(f"Size: `{ord_.size:.5f}` {_BASE_CCY}")
+                oc4.write(f"Status: `{ord_.status}`")
+                if oc5.button("Cancel", key=f"{prefix}_cancel_ord_{ord_.order_id}"):
+                    _co_ok = False
+                    with st.spinner("Cancelling…"):
+                        try:
+                            _cb2 = BitgetBroker()
+                            _cb2.cancel_order(ord_.order_id)
+                            st.cache_data.clear()
+                            _co_ok = True
+                        except Exception as exc:
+                            st.error(str(exc))
+                    if _co_ok:
+                        st.success("Order cancelled.")
+                        st.rerun()
+    else:
+        st.info("No open orders.")
+
+
+def render_danger_zone(prefix: str) -> None:
+    st.warning("These actions are irreversible and affect live exchange positions.")
+
+    _dz_confirm = st.checkbox(
+        "I understand this will affect live exchange positions/orders",
+        key=f"{prefix}_dz_confirm",
+    )
+
+    dz1, dz2 = st.columns(2)
+
+    if dz1.button("Close ALL Positions", type="secondary", use_container_width=True, key=f"{prefix}_close_all_pos", disabled=not _dz_confirm):
+        _dz_ok = False
+        with st.spinner("Closing all positions…"):
+            try:
+                _dz = BitgetBroker()
+                for pos in _dz.get_open_positions():
+                    _dz.close_position(pos)
+                st.cache_data.clear()
+                _dz_ok = True
+            except Exception as exc:
+                st.error(str(exc))
+        if _dz_ok:
+            st.success("All positions closed.")
+            st.rerun()
+
+    if dz2.button("Cancel ALL Orders", type="secondary", use_container_width=True, key=f"{prefix}_cancel_all_orders", disabled=not _dz_confirm):
+        _dz2_ok = False
+        with st.spinner("Cancelling all orders…"):
+            try:
+                _dz2 = BitgetBroker()
+                _dz2.cancel_all_orders()
+                st.cache_data.clear()
+                _dz2_ok = True
+            except Exception as exc:
+                st.error(str(exc))
+        if _dz2_ok:
+            st.success("All orders cancelled.")
+            st.rerun()
+
+
+def _win_rate_block(trades, group_field: str, group_values, label_fn=str) -> None:
+    """Render one win-rate/P&L line per group value (e.g. per session or per side)."""
+    for _gval in group_values:
+        _gt  = [t for t in trades if t.get(group_field) == _gval]
+        _gw  = sum(1 for t in _gt if (t["pnl_usdt"] or 0) > 0)
+        _gp  = sum(t["pnl_usdt"] or 0 for t in _gt)
+        _gwr = _gw / len(_gt) * 100 if _gt else 0
+        _color = "#00cc96" if _gp >= 0 else "#ef553b"
+        st.markdown(
+            f"**{label_fn(_gval)}** — {len(_gt)} trades &nbsp;·&nbsp; {_gwr:.0f}% WR &nbsp;·&nbsp; "
+            f"<span style='color:{_color}'>${_gp:+.2f}</span>",
+            unsafe_allow_html=True,
+        )
+
+
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 tab_dash, tab_strategy, tab_chart, tab_sim, tab_journal, tab_admin, tab_logs = st.tabs(
@@ -494,8 +876,8 @@ with tab_dash:
     st.divider()
 
     # ── Performance Analytics ──────────────────────────────────────────────────
-    _dc = journal.get_closed_trades()
-    _ds = journal.get_stats()
+    _dc = closed_trades
+    _ds = journal_stats
 
     _avg_win   = _ds.get("avg_win",  0.0)
     _avg_loss  = _ds.get("avg_loss", 0.0)   # negative value
@@ -533,32 +915,12 @@ with tab_dash:
     with col_ses:
         with st.container(border=True):
             st.markdown("**Session Breakdown**")
-            for _sname in ["London", "NY", "Manual"]:
-                _st = [t for t in _dc if t.get("session") == _sname]
-                _sw = sum(1 for t in _st if (t["pnl_usdt"] or 0) > 0)
-                _sp = sum(t["pnl_usdt"] or 0 for t in _st)
-                _swr = _sw / len(_st) * 100 if _st else 0
-                _color = "#00cc96" if _sp >= 0 else "#ef553b"
-                st.markdown(
-                    f"**{_sname}** — {len(_st)} trades &nbsp;·&nbsp; {_swr:.0f}% WR &nbsp;·&nbsp; "
-                    f"<span style='color:{_color}'>${_sp:+.2f}</span>",
-                    unsafe_allow_html=True,
-                )
+            _win_rate_block(_dc, "session", ["London", "NY", "Manual"])
 
     with col_side:
         with st.container(border=True):
             st.markdown("**Long vs Short**")
-            for _side in ["long", "short"]:
-                _st = [t for t in _dc if t.get("side") == _side]
-                _sw = sum(1 for t in _st if (t["pnl_usdt"] or 0) > 0)
-                _sp = sum(t["pnl_usdt"] or 0 for t in _st)
-                _swr = _sw / len(_st) * 100 if _st else 0
-                _color = "#00cc96" if _sp >= 0 else "#ef553b"
-                st.markdown(
-                    f"**{_side.upper()}** — {len(_st)} trades &nbsp;·&nbsp; {_swr:.0f}% WR &nbsp;·&nbsp; "
-                    f"<span style='color:{_color}'>${_sp:+.2f}</span>",
-                    unsafe_allow_html=True,
-                )
+            _win_rate_block(_dc, "side", ["long", "short"], label_fn=str.upper)
 
     with col_recent:
         with st.container(border=True):
@@ -592,94 +954,17 @@ with tab_dash:
     # ── Bot Control & System ──────────────────────────────────────────────────
     with st.expander("⚙️  Bot Control & System", expanded=False):
         st.markdown("**API & Account**")
-        _a1, _a2, _a3, _a4 = st.columns(4)
-        _a1.metric("Mode",    config.TRADING_MODE.upper())
-        _a2.metric("Symbol",  config.SYMBOL)
-        _a3.metric("Balance", f"${balance:,.2f} USDT" if balance else "—")
-        _a4.metric("Open Positions", len(open_positions))
-
-        _tc1, _tc2 = st.columns(2)
-        if _tc1.button("Test API Connection", key="dash_test_api_btn"):
-            with st.spinner("Connecting…"):
-                try:
-                    _test_broker = BitgetBroker()
-                    _test_bal    = _test_broker.get_account_balance()
-                    st.success(f"Connected. Available balance: **${_test_bal:,.2f} USDT**")
-                except Exception as exc:
-                    st.error(f"Connection failed: {exc}")
-
-        if _tc2.button("Test Discord Webhook", key="dash_test_discord_btn"):
-            if not config.DISCORD_WEBHOOK_URL:
-                st.error("DISCORD_WEBHOOK_URL is not set in .env")
-            else:
-                with st.spinner("Sending test message…"):
-                    import requests as _req
-                    _r = _req.post(
-                        config.DISCORD_WEBHOOK_URL,
-                        json={"content": f"✅ **EntryA-Bot** — webhook test from dashboard ({config.SYMBOL} | {config.TRADING_MODE.upper()})"},
-                        timeout=10,
-                    )
-                    if _r.status_code in (200, 204):
-                        st.success("Test message sent to Discord.")
-                    else:
-                        st.error(f"Webhook returned {_r.status_code}: {_r.text[:200]}")
+        render_api_account("dash")
 
         st.divider()
 
         st.markdown("**Bot Controls**")
-        bc1, bc2, bc3 = st.columns(3)
-        _running = bot_is_running()
-        bc1.metric("Bot Status", "RUNNING" if _running else "STOPPED")
-        bc2.metric("Mode", "DRY RUN" if st.session_state.dry_run else "LIVE")
-        _pid_display = st.session_state.bot_proc.pid if st.session_state.bot_proc else _find_external_bot_pid()
-        bc3.metric("PID", str(_pid_display) if _running and _pid_display else "—")
-
-        ab1, ab2, ab3 = st.columns(3)
-        if ab1.button("Start Bot (Live)", disabled=_running, use_container_width=True, type="primary", key="dash_start_live"):
-            start_bot(dry_run=False)
-            st.rerun()
-        if ab2.button("Start Bot (Dry Run)", disabled=_running, use_container_width=True, key="dash_start_dry"):
-            start_bot(dry_run=True)
-            st.rerun()
-        if ab3.button("Stop Bot", disabled=not _running, use_container_width=True, type="secondary", key="dash_stop_bot"):
-            stop_bot()
-            st.rerun()
+        render_bot_controls("dash")
 
     # ── Live Positions & Orders ───────────────────────────────────────────────
     with st.expander("📋  Live Positions & Orders", expanded=False):
         st.markdown("**Live Positions**")
-        if open_positions:
-            for pos in open_positions:
-                with st.container(border=True):
-                    pc1, pc2, pc3, pc4, pc5 = st.columns([2, 2, 2, 2, 1])
-                    pc1.write(f"**{pos.symbol}** — {'LONG' if pos.side=='long' else 'SHORT'}")
-                    pc2.write(f"Size: `{pos.size:.5f}` {_BASE_CCY}")
-                    pc3.write(f"Entry: `{pos.entry_price:,.4f}`")
-                    pc4.write(f"uPnL: `{pos.unrealised_pnl:+,.4f}` USDT")
-                    if pc5.button("Close", key=f"dash_close_pos_{pos.symbol}_{pos.side}"):
-                        _cp_ok = False
-                        with st.spinner("Closing…"):
-                            try:
-                                _cb = BitgetBroker()
-                                _cb.close_position(pos)
-                                # Cancel any leftover SL/TP trigger orders for this
-                                # symbol — Bitget doesn't always auto-cancel them
-                                # when a position is closed this way, and since this
-                                # bot only ever holds one position at a time, a
-                                # blanket cancel here is safe.
-                                try:
-                                    _cb.cancel_all_orders()
-                                except Exception:
-                                    pass
-                                st.cache_data.clear()
-                                _cp_ok = True
-                            except Exception as exc:
-                                st.error(str(exc))
-                        if _cp_ok:
-                            st.success("Position closed.")
-                            st.rerun()
-        else:
-            st.info("No open positions on the exchange.")
+        render_live_positions("dash")
 
         st.divider()
 
@@ -688,205 +973,27 @@ with tab_dash:
         if _oh2.button("Refresh", use_container_width=True, key="dash_refresh_orders"):
             st.cache_data.clear()
             st.rerun()
-
-        try:
-            _broker_orders = BitgetBroker()
-            open_orders    = _broker_orders.get_open_orders()
-        except Exception:
-            open_orders = []
-
-        if open_orders:
-            for ord_ in open_orders:
-                with st.container(border=True):
-                    oc1, oc2, oc3, oc4, oc5 = st.columns([2, 2, 2, 2, 1])
-                    oc1.write(f"**{ord_.symbol}**")
-                    oc2.write(f"{ord_.order_type.upper()} — {ord_.side.upper()}")
-                    oc3.write(f"Size: `{ord_.size:.5f}` {_BASE_CCY}")
-                    oc4.write(f"Status: `{ord_.status}`")
-                    if oc5.button("Cancel", key=f"dash_cancel_ord_{ord_.order_id}"):
-                        _co_ok = False
-                        with st.spinner("Cancelling…"):
-                            try:
-                                _cb2 = BitgetBroker()
-                                _cb2.cancel_order(ord_.order_id)
-                                st.cache_data.clear()
-                                _co_ok = True
-                            except Exception as exc:
-                                st.error(str(exc))
-                        if _co_ok:
-                            st.success("Order cancelled.")
-                            st.rerun()
-        else:
-            st.info("No open orders.")
+        render_open_orders_list("dash")
 
     # ── Manual Discord Alerts ─────────────────────────────────────────────────
     with st.expander("🔔  Manual Discord Alerts", expanded=False):
-        st.caption("Use these when you enter or exit a trade manually on Bitget.")
-
-        with st.form("discord_manual_entry"):
-            st.markdown("**Manual Trade Entry Alert**")
-            _mn1, _mn2, _mn3 = st.columns(3)
-            _mn_session   = _mn1.selectbox("Session", ["London", "NY"], key="dash_mn_session")
-            _mn_direction = _mn2.selectbox("Direction", ["long", "short"], key="dash_mn_direction")
-            _mn_entry     = _mn3.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key="dash_mn_entry")
-            _mn4, _mn5, _mn6 = st.columns(3)
-            _mn_sl        = _mn4.number_input("SL Price",    min_value=0.01, value=float(current_price or 0) * 0.99, format="%.2f", key="dash_mn_sl")
-            _mn_tp        = _mn5.number_input("TP Price",    min_value=0.01, value=float(current_price or 0) * 1.01, format="%.2f", key="dash_mn_tp")
-            _mn_size      = _mn6.number_input("Size (USDT)", min_value=1.0,  value=float(config.ALGO_POSITION_USDT), format="%.0f", key="dash_mn_size")
-            if st.form_submit_button("Send Entry Alert", type="primary"):
-                _ok = _notifier.trade_entry(
-                    session=_mn_session,
-                    direction=_mn_direction,
-                    entry_price=_mn_entry,
-                    sl_price=_mn_sl,
-                    tp_price=_mn_tp,
-                    contracts=round(_mn_size * config.LEVERAGE / _mn_entry / config.CONTRACT_SIZE) * config.CONTRACT_SIZE,
-                    usdt_size=_mn_size,
-                    entry_id="manual",
-                )
-                if _ok:
-                    st.success("Entry alert sent to Discord.")
-                else:
-                    st.error("Discord send failed — check the webhook URL in .env and the app logs.")
-
-        with st.form("discord_manual_close"):
-            st.markdown("**Manual Trade Close Alert**")
-            _mc1, _mc2, _mc3 = st.columns(3)
-            _mc_session   = _mc1.selectbox("Session", ["London", "NY"], key="dash_mc_sess")
-            _mc_direction = _mc2.selectbox("Direction", ["long", "short"], key="dash_mc_dir")
-            _mc_result    = _mc3.selectbox("Result", ["tp_hit", "sl_hit"], key="dash_mc_result")
-            _mc4, _mc5, _mc6 = st.columns(3)
-            _mc_entry     = _mc4.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key="dash_mc_entry")
-            _mc_exit      = _mc5.number_input("Exit Price",  min_value=0.01, value=float(current_price or 0), format="%.2f", key="dash_mc_exit")
-            _mc_pnl       = _mc6.number_input("P&L (USDT)",  value=0.0, format="%.2f", key="dash_mc_pnl")
-            if st.form_submit_button("Send Close Alert", type="primary"):
-                _ok = _notifier.trade_closed(
-                    result=_mc_result,
-                    session=_mc_session,
-                    direction=_mc_direction,
-                    entry_price=_mc_entry,
-                    exit_price=_mc_exit,
-                    pnl_usdt=_mc_pnl,
-                    pnl_pct=0.0,
-                    daily_pnl_pct=float(daily_pnl or 0),
-                )
-                if _ok:
-                    st.success("Close alert sent to Discord.")
-                else:
-                    st.error("Discord send failed — check the webhook URL in .env and the app logs.")
+        render_discord_alerts("dash")
 
     # ── Strategy & Risk Settings ──────────────────────────────────────────────
     with st.expander("🛠️  Strategy & Risk Settings", expanded=False):
         st.markdown("**Risk Parameters**")
         st.caption("Changes update `.env` and take effect on next app restart.")
-
-        with st.form("risk_params"):
-            rp1, rp2, rp3, rp4 = st.columns(4)
-            new_leverage = rp1.number_input(
-                "Leverage", min_value=1, max_value=125,
-                value=int(config.LEVERAGE), step=1, key="dash_leverage",
-            )
-            new_risk = rp2.number_input(
-                "Risk per Trade (%)", min_value=0.1, max_value=10.0,
-                value=config.RISK_PER_TRADE_PCT * 100, step=0.1, format="%.1f", key="dash_risk_pct",
-            )
-            new_symbol = rp3.text_input("Symbol", value=config.SYMBOL, key="dash_symbol")
-            new_mode   = rp4.selectbox(
-                "Trading Mode", ["demo", "live"],
-                index=0 if config.TRADING_MODE == "demo" else 1, key="dash_trading_mode",
-            )
-
-            if st.form_submit_button("Save Settings", type="primary"):
-                _update_env("LEVERAGE",           str(new_leverage))
-                _update_env("RISK_PER_TRADE_PCT", str(new_risk / 100))
-                _update_env("SYMBOL",             new_symbol)
-                _update_env("TRADING_MODE",       new_mode)
-                st.success("Settings saved to `.env`. Restart the app to apply.")
+        render_risk_params_form("dash")
 
         st.divider()
 
         st.markdown("**Strategy Parameters**")
         st.caption("Position size, SL%, and ORB timers. All times in UTC. Changes saved to `.env` — restart bot to apply.")
-
-        with st.form("strategy_params"):
-            _sp1, _sp2, _sp3 = st.columns(3)
-            _new_algo_size = _sp1.number_input(
-                "Algo Position Size (USDT)", min_value=1.0, max_value=100_000.0,
-                value=float(config.ALGO_POSITION_USDT), step=10.0, format="%.0f",
-                help="Fixed USDT margin per algo trade (uses configured leverage). Set 0 to use risk-% sizing.",
-                key="dash_algo_size",
-            )
-            _new_london_sl = _sp2.number_input(
-                "London SL %", min_value=0.05, max_value=5.0,
-                value=config.LONDON_SL_PCT * 100, step=0.05, format="%.2f", key="dash_london_sl",
-            )
-            _new_ny_sl = _sp3.number_input(
-                "NY SL %", min_value=0.05, max_value=5.0,
-                value=config.NY_SL_PCT * 100, step=0.05, format="%.2f", key="dash_ny_sl",
-            )
-
-            st.markdown("ORB Window — London (UTC)")
-            _ol1, _ol2, _ol3, _ol4 = st.columns(4)
-            _new_lon_sh = _ol1.number_input("Start Hour",  0, 23, config.SESSIONS[0].orb_start_h, key="dash_lon_sh")
-            _new_lon_sm = _ol2.number_input("Start Min",   0, 59, config.SESSIONS[0].orb_start_m, key="dash_lon_sm")
-            _new_lon_eh = _ol3.number_input("End Hour",    0, 23, config.SESSIONS[0].orb_end_h,   key="dash_lon_eh")
-            _new_lon_em = _ol4.number_input("End Min",     0, 59, config.SESSIONS[0].orb_end_m,   key="dash_lon_em")
-
-            st.markdown("ORB Window — NY (UTC)")
-            _on1, _on2, _on3, _on4 = st.columns(4)
-            _new_ny_sh  = _on1.number_input("Start Hour",  0, 23, config.SESSIONS[1].orb_start_h, key="dash_ny_sh")
-            _new_ny_sm  = _on2.number_input("Start Min",   0, 59, config.SESSIONS[1].orb_start_m, key="dash_ny_sm")
-            _new_ny_eh  = _on3.number_input("End Hour",    0, 23, config.SESSIONS[1].orb_end_h,   key="dash_ny_eh")
-            _new_ny_em  = _on4.number_input("End Min",     0, 59, config.SESSIONS[1].orb_end_m,   key="dash_ny_em")
-
-            if st.form_submit_button("Save Strategy Settings", type="primary"):
-                _update_env("ALGO_POSITION_USDT",  str(int(_new_algo_size)))
-                _update_env("LONDON_SL_PCT",       f"{_new_london_sl / 100:.4f}")
-                _update_env("NY_SL_PCT",           f"{_new_ny_sl / 100:.4f}")
-                _update_env("LONDON_ORB_START_H",  str(_new_lon_sh))
-                _update_env("LONDON_ORB_START_M",  str(_new_lon_sm))
-                _update_env("LONDON_ORB_END_H",    str(_new_lon_eh))
-                _update_env("LONDON_ORB_END_M",    str(_new_lon_em))
-                _update_env("NY_ORB_START_H",      str(_new_ny_sh))
-                _update_env("NY_ORB_START_M",      str(_new_ny_sm))
-                _update_env("NY_ORB_END_H",        str(_new_ny_eh))
-                _update_env("NY_ORB_END_M",        str(_new_ny_em))
-                st.success("Strategy settings saved. Restart the app and bot to apply.")
+        render_strategy_params_form("dash")
 
     # ── Danger Zone ────────────────────────────────────────────────────────────
     with st.expander("⚠️  Danger Zone", expanded=False):
-        st.warning("These actions are irreversible and affect live exchange positions.")
-
-        dz1, dz2 = st.columns(2)
-
-        if dz1.button("Close ALL Positions", type="secondary", use_container_width=True, key="dash_close_all_pos"):
-            _dz_ok = False
-            with st.spinner("Closing all positions…"):
-                try:
-                    _dz = BitgetBroker()
-                    for pos in _dz.get_open_positions():
-                        _dz.close_position(pos)
-                    st.cache_data.clear()
-                    _dz_ok = True
-                except Exception as exc:
-                    st.error(str(exc))
-            if _dz_ok:
-                st.success("All positions closed.")
-                st.rerun()
-
-        if dz2.button("Cancel ALL Orders", type="secondary", use_container_width=True, key="dash_cancel_all_orders"):
-            _dz2_ok = False
-            with st.spinner("Cancelling all orders…"):
-                try:
-                    _dz2 = BitgetBroker()
-                    _dz2.cancel_all_orders()
-                    st.cache_data.clear()
-                    _dz2_ok = True
-                except Exception as exc:
-                    st.error(str(exc))
-            if _dz2_ok:
-                st.success("All orders cancelled.")
-                st.rerun()
+        render_danger_zone("dash")
 
 
 # ─── Tab: Strategy ─────────────────────────────────────────────────────────────
@@ -1318,12 +1425,7 @@ with tab_chart:
                           annotation_font=dict(color="#26a69a", size=11))
 
         # ── Closed trades today — entry→exit line with PnL ─────────────────
-        try:
-            _closed_today = journal.get_closed_trades()
-        except Exception:
-            _closed_today = []
-
-        for _ct in _closed_today:
+        for _ct in closed_trades:
             try:
                 _ct_entry_t = pd.to_datetime(_ct["entry_time"], utc=True).to_pydatetime()
                 _ct_exit_t  = pd.to_datetime(_ct["exit_time"],  utc=True).to_pydatetime()
@@ -1429,21 +1531,12 @@ with tab_chart:
                     if not _closed:
                         raise RuntimeError(f"Close rejected: {_b.last_error}")
 
-                    # Fetch actual P&L from Bitget history (most accurate)
-                    _pos_data_close = _b.get_closed_position_data(_hold_side)
-                    if _pos_data_close is not None:
-                        _pnl_usdt  = _pos_data_close["net_pnl"]
-                        _fees      = _pos_data_close["fees"]
-                        _exit_used = _pos_data_close["exit_price"] or current_price or m_entry
-                    else:
-                        if is_long:
-                            _pnl_usdt = (current_price - m_entry) * m_size
-                        else:
-                            _pnl_usdt = (m_entry - current_price) * m_size
-                        _fees      = (_notional or 0) * 0.0006
-                        _exit_used = current_price or m_entry
-                    _margin_used = (_notional or 1) / max(m_lev, 1)
-                    _pnl_pct = _pnl_usdt / _margin_used * 100
+                    # Fetch actual P&L from Bitget history (most accurate),
+                    # falling back to an SL/TP-aware estimate on any failure.
+                    _exit_used, _pnl_usdt, _pnl_pct, _fees = _compute_close_pnl(
+                        _hold_side, m_entry, m_size, _notional, m_lev,
+                        m_sl, m_tp, current_price, broker=_b,
+                    )
                     journal.close_trade(
                         trade_id   = mt.get("trade_id", "unknown"),
                         exit_price = _exit_used,
@@ -1765,10 +1858,7 @@ with tab_sim:
             with _col:
                 with st.container(border=True):
                     st.markdown(f"**{_lbl} Session**")
-                    _bias_txt = (
-                        ("BEARISH (short only)" if _sess_snap.bias_bearish else "BULLISH (long only)")
-                        if _sess_snap.bias_bearish is not None else "Pending"
-                    )
+                    _bias_txt = _bias_label(_sess_snap.bias_bearish)
                     st.write(f"Phase: **{_sess_snap.phase.replace('_', ' ').title()}**")
                     st.write(f"Bias: **{_bias_txt}**")
                     if _sess_snap.orb_high and _sess_snap.orb_low:
@@ -1884,8 +1974,7 @@ with tab_journal:
     st.subheader("Trading Journal")
 
     all_trades    = journal.get_all_trades()
-    closed_trades = journal.get_closed_trades()
-    stats         = journal.get_stats()
+    stats         = journal_stats
     boosts        = journal.get_boosts()
 
     # ── Stats cards ────────────────────────────────────────────────────────────
@@ -2039,10 +2128,9 @@ with tab_journal:
     st.divider()
     st.markdown("### Position Scaling & Boost Tracker")
 
-    _eq              = float(balance or 0)
-    _cur, _nxt, _pct = get_ladder_progress(_eq)
-    _at_max          = _nxt is None
-    _streak          = boost_streak_info(closed_trades)
+    _eq          = float(balance or 0)
+    _cur, _nxt, _ = get_ladder_progress(_eq)
+    _streak      = boost_streak_info(closed_trades)
     _boost_on        = _streak["boost_active"]
     _pos_usdt_active = _cur.boosted_usdt if _boost_on else _cur.default_usdt
     _pos_btc         = _pos_usdt_active * config.LEVERAGE / float(current_price) if current_price else 0
@@ -2147,232 +2235,39 @@ with tab_admin:
 
     # ── API Status ─────────────────────────────────────────────────────────────
     st.markdown("### API & Account")
-
-    _a1, _a2, _a3, _a4 = st.columns(4)
-    _a1.metric("Mode",    config.TRADING_MODE.upper())
-    _a2.metric("Symbol",  config.SYMBOL)
-    _a3.metric("Balance", f"${balance:,.2f} USDT" if balance else "—")
-    _a4.metric("Open Positions", len(open_positions))
-
-    _tc1, _tc2 = st.columns(2)
-    if _tc1.button("Test API Connection", key="admin_test_api_btn"):
-        with st.spinner("Connecting…"):
-            try:
-                _test_broker = BitgetBroker()
-                _test_bal    = _test_broker.get_account_balance()
-                st.success(f"Connected. Available balance: **${_test_bal:,.2f} USDT**")
-            except Exception as exc:
-                st.error(f"Connection failed: {exc}")
-
-    if _tc2.button("Test Discord Webhook", key="admin_test_discord_btn"):
-        if not config.DISCORD_WEBHOOK_URL:
-            st.error("DISCORD_WEBHOOK_URL is not set in .env")
-        else:
-            with st.spinner("Sending test message…"):
-                import requests as _req
-                _r = _req.post(
-                    config.DISCORD_WEBHOOK_URL,
-                    json={"content": f"✅ **EntryA-Bot** — webhook test from dashboard ({config.SYMBOL} | {config.TRADING_MODE.upper()})"},
-                    timeout=10,
-                )
-                if _r.status_code in (200, 204):
-                    st.success("Test message sent to Discord.")
-                else:
-                    st.error(f"Webhook returned {_r.status_code}: {_r.text[:200]}")
+    render_api_account("admin")
 
     st.divider()
 
     # ── Manual Discord Alerts ──────────────────────────────────────────────────
     st.markdown("### Manual Discord Alerts")
-    st.caption("Use these when you enter or exit a trade manually on Bitget.")
-
-    with st.form("discord_manual_entry_admin"):
-        st.markdown("**Manual Trade Entry Alert**")
-        _mn1, _mn2, _mn3 = st.columns(3)
-        _mn_session   = _mn1.selectbox("Session", ["London", "NY"], key="admin_mn_session")
-        _mn_direction = _mn2.selectbox("Direction", ["long", "short"], key="admin_mn_direction")
-        _mn_entry     = _mn3.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key="admin_mn_entry")
-        _mn4, _mn5, _mn6 = st.columns(3)
-        _mn_sl        = _mn4.number_input("SL Price",    min_value=0.01, value=float(current_price or 0) * 0.99, format="%.2f", key="admin_mn_sl")
-        _mn_tp        = _mn5.number_input("TP Price",    min_value=0.01, value=float(current_price or 0) * 1.01, format="%.2f", key="admin_mn_tp")
-        _mn_size      = _mn6.number_input("Size (USDT)", min_value=1.0,  value=float(config.ALGO_POSITION_USDT), format="%.0f", key="admin_mn_size")
-        if st.form_submit_button("Send Entry Alert", type="primary"):
-            _ok = _notifier.trade_entry(
-                session=_mn_session,
-                direction=_mn_direction,
-                entry_price=_mn_entry,
-                sl_price=_mn_sl,
-                tp_price=_mn_tp,
-                contracts=round(_mn_size * config.LEVERAGE / _mn_entry / config.CONTRACT_SIZE) * config.CONTRACT_SIZE,
-                usdt_size=_mn_size,
-                entry_id="manual",
-            )
-            if _ok:
-                st.success("Entry alert sent to Discord.")
-            else:
-                st.error("Discord send failed — check the webhook URL in .env and the app logs.")
-
-    with st.form("discord_manual_close_admin"):
-        st.markdown("**Manual Trade Close Alert**")
-        _mc1, _mc2, _mc3 = st.columns(3)
-        _mc_session   = _mc1.selectbox("Session", ["London", "NY"], key="admin_mc_sess")
-        _mc_direction = _mc2.selectbox("Direction", ["long", "short"], key="admin_mc_dir")
-        _mc_result    = _mc3.selectbox("Result", ["tp_hit", "sl_hit"], key="admin_mc_result")
-        _mc4, _mc5, _mc6 = st.columns(3)
-        _mc_entry     = _mc4.number_input("Entry Price", min_value=0.01, value=float(current_price or 0), format="%.2f", key="admin_mc_entry")
-        _mc_exit      = _mc5.number_input("Exit Price",  min_value=0.01, value=float(current_price or 0), format="%.2f", key="admin_mc_exit")
-        _mc_pnl       = _mc6.number_input("P&L (USDT)",  value=0.0, format="%.2f", key="admin_mc_pnl")
-        if st.form_submit_button("Send Close Alert", type="primary"):
-            _ok = _notifier.trade_closed(
-                result=_mc_result,
-                session=_mc_session,
-                direction=_mc_direction,
-                entry_price=_mc_entry,
-                exit_price=_mc_exit,
-                pnl_usdt=_mc_pnl,
-                pnl_pct=0.0,
-                daily_pnl_pct=float(daily_pnl or 0),
-            )
-            if _ok:
-                st.success("Close alert sent to Discord.")
-            else:
-                st.error("Discord send failed — check the webhook URL in .env and the app logs.")
+    render_discord_alerts("admin")
 
     st.divider()
 
     # ── Bot Controls ───────────────────────────────────────────────────────────
     st.markdown("### Bot Controls")
-
-    bc1, bc2, bc3 = st.columns(3)
-    _running = bot_is_running()
-    bc1.metric("Bot Status", "RUNNING" if _running else "STOPPED")
-    bc2.metric("Mode", "DRY RUN" if st.session_state.dry_run else "LIVE")
-    _pid_display = st.session_state.bot_proc.pid if st.session_state.bot_proc else _find_external_bot_pid()
-    bc3.metric("PID", str(_pid_display) if _running and _pid_display else "—")
-
-    ab1, ab2, ab3 = st.columns(3)
-    if ab1.button("Start Bot (Live)", disabled=_running, use_container_width=True, type="primary", key="admin_start_live"):
-        start_bot(dry_run=False)
-        st.rerun()
-    if ab2.button("Start Bot (Dry Run)", disabled=_running, use_container_width=True, key="admin_start_dry"):
-        start_bot(dry_run=True)
-        st.rerun()
-    if ab3.button("Stop Bot", disabled=not _running, use_container_width=True, type="secondary", key="admin_stop_bot"):
-        stop_bot()
-        st.rerun()
+    render_bot_controls("admin")
 
     st.divider()
 
     # ── Risk Parameters ────────────────────────────────────────────────────────
     st.markdown("### Risk Parameters")
     st.caption("Changes update `.env` and take effect on next app restart.")
-
-    with st.form("risk_params_admin"):
-        rp1, rp2, rp3, rp4 = st.columns(4)
-        new_leverage = rp1.number_input(
-            "Leverage", min_value=1, max_value=125,
-            value=int(config.LEVERAGE), step=1, key="admin_leverage",
-        )
-        new_risk = rp2.number_input(
-            "Risk per Trade (%)", min_value=0.1, max_value=10.0,
-            value=config.RISK_PER_TRADE_PCT * 100, step=0.1, format="%.1f", key="admin_risk_pct",
-        )
-        new_symbol = rp3.text_input("Symbol", value=config.SYMBOL, key="admin_symbol")
-        new_mode   = rp4.selectbox(
-            "Trading Mode", ["demo", "live"],
-            index=0 if config.TRADING_MODE == "demo" else 1, key="admin_trading_mode",
-        )
-
-        if st.form_submit_button("Save Settings", type="primary"):
-            _update_env("LEVERAGE",           str(new_leverage))
-            _update_env("RISK_PER_TRADE_PCT", str(new_risk / 100))
-            _update_env("SYMBOL",             new_symbol)
-            _update_env("TRADING_MODE",       new_mode)
-            st.success("Settings saved to `.env`. Restart the app to apply.")
+    render_risk_params_form("admin")
 
     st.divider()
 
     # ── Strategy Parameters ────────────────────────────────────────────────────
     st.markdown("### Strategy Parameters")
     st.caption("Position size, SL%, and ORB timers. All times in UTC. Changes saved to `.env` — restart bot to apply.")
-
-    with st.form("strategy_params_admin"):
-        _sp1, _sp2, _sp3 = st.columns(3)
-        _new_algo_size = _sp1.number_input(
-            "Algo Position Size (USDT)", min_value=1.0, max_value=100_000.0,
-            value=float(config.ALGO_POSITION_USDT), step=10.0, format="%.0f",
-            help="Fixed USDT margin per algo trade (uses configured leverage). Set 0 to use risk-% sizing.",
-            key="admin_algo_size",
-        )
-        _new_london_sl = _sp2.number_input(
-            "London SL %", min_value=0.05, max_value=5.0,
-            value=config.LONDON_SL_PCT * 100, step=0.05, format="%.2f", key="admin_london_sl",
-        )
-        _new_ny_sl = _sp3.number_input(
-            "NY SL %", min_value=0.05, max_value=5.0,
-            value=config.NY_SL_PCT * 100, step=0.05, format="%.2f", key="admin_ny_sl",
-        )
-
-        st.markdown("**ORB Window — London (UTC)**")
-        _ol1, _ol2, _ol3, _ol4 = st.columns(4)
-        _new_lon_sh = _ol1.number_input("Start Hour",  0, 23, config.SESSIONS[0].orb_start_h, key="admin_lon_sh")
-        _new_lon_sm = _ol2.number_input("Start Min",   0, 59, config.SESSIONS[0].orb_start_m, key="admin_lon_sm")
-        _new_lon_eh = _ol3.number_input("End Hour",    0, 23, config.SESSIONS[0].orb_end_h,   key="admin_lon_eh")
-        _new_lon_em = _ol4.number_input("End Min",     0, 59, config.SESSIONS[0].orb_end_m,   key="admin_lon_em")
-
-        st.markdown("**ORB Window — NY (UTC)**")
-        _on1, _on2, _on3, _on4 = st.columns(4)
-        _new_ny_sh  = _on1.number_input("Start Hour",  0, 23, config.SESSIONS[1].orb_start_h, key="admin_ny_sh")
-        _new_ny_sm  = _on2.number_input("Start Min",   0, 59, config.SESSIONS[1].orb_start_m, key="admin_ny_sm")
-        _new_ny_eh  = _on3.number_input("End Hour",    0, 23, config.SESSIONS[1].orb_end_h,   key="admin_ny_eh")
-        _new_ny_em  = _on4.number_input("End Min",     0, 59, config.SESSIONS[1].orb_end_m,   key="admin_ny_em")
-
-        if st.form_submit_button("Save Strategy Settings", type="primary"):
-            _update_env("ALGO_POSITION_USDT",  str(int(_new_algo_size)))
-            _update_env("LONDON_SL_PCT",       f"{_new_london_sl / 100:.4f}")
-            _update_env("NY_SL_PCT",           f"{_new_ny_sl / 100:.4f}")
-            _update_env("LONDON_ORB_START_H",  str(_new_lon_sh))
-            _update_env("LONDON_ORB_START_M",  str(_new_lon_sm))
-            _update_env("LONDON_ORB_END_H",    str(_new_lon_eh))
-            _update_env("LONDON_ORB_END_M",    str(_new_lon_em))
-            _update_env("NY_ORB_START_H",      str(_new_ny_sh))
-            _update_env("NY_ORB_START_M",      str(_new_ny_sm))
-            _update_env("NY_ORB_END_H",        str(_new_ny_eh))
-            _update_env("NY_ORB_END_M",        str(_new_ny_em))
-            st.success("Strategy settings saved. Restart the app and bot to apply.")
+    render_strategy_params_form("admin")
 
     st.divider()
 
     # ── Positions & Orders ─────────────────────────────────────────────────────
     st.markdown("### Live Positions")
-
-    if open_positions:
-        for pos in open_positions:
-            with st.container(border=True):
-                pc1, pc2, pc3, pc4, pc5 = st.columns([2, 2, 2, 2, 1])
-                pc1.write(f"**{pos.symbol}** — {'LONG' if pos.side=='long' else 'SHORT'}")
-                pc2.write(f"Size: `{pos.size:.5f}` {_BASE_CCY}")
-                pc3.write(f"Entry: `{pos.entry_price:,.4f}`")
-                pc4.write(f"uPnL: `{pos.unrealised_pnl:+,.4f}` USDT")
-                if pc5.button("Close", key=f"admin_close_pos_{pos.symbol}_{pos.side}"):
-                    _cp_ok = False
-                    with st.spinner("Closing…"):
-                        try:
-                            _cb = BitgetBroker()
-                            _cb.close_position(pos)
-                            try:
-                                _cb.cancel_all_orders()
-                            except Exception:
-                                pass
-                            st.cache_data.clear()
-                            _cp_ok = True
-                        except Exception as exc:
-                            st.error(str(exc))
-                    if _cp_ok:
-                        st.success("Position closed.")
-                        st.rerun()
-    else:
-        st.info("No open positions on the exchange.")
+    render_live_positions("admin")
 
     st.divider()
 
@@ -2381,73 +2276,13 @@ with tab_admin:
     if st.button("Refresh Orders", key="admin_refresh_orders"):
         st.cache_data.clear()
         st.rerun()
-
-    try:
-        _broker_orders = BitgetBroker()
-        open_orders    = _broker_orders.get_open_orders()
-    except Exception:
-        open_orders = []
-
-    if open_orders:
-        for ord_ in open_orders:
-            with st.container(border=True):
-                oc1, oc2, oc3, oc4, oc5 = st.columns([2, 2, 2, 2, 1])
-                oc1.write(f"**{ord_.symbol}**")
-                oc2.write(f"{ord_.order_type.upper()} — {ord_.side.upper()}")
-                oc3.write(f"Size: `{ord_.size:.5f}` {_BASE_CCY}")
-                oc4.write(f"Status: `{ord_.status}`")
-                if oc5.button("Cancel", key=f"admin_cancel_ord_{ord_.order_id}"):
-                    _co_ok = False
-                    with st.spinner("Cancelling…"):
-                        try:
-                            _cb2 = BitgetBroker()
-                            _cb2.cancel_order(ord_.order_id)
-                            st.cache_data.clear()
-                            _co_ok = True
-                        except Exception as exc:
-                            st.error(str(exc))
-                    if _co_ok:
-                        st.success("Order cancelled.")
-                        st.rerun()
-    else:
-        st.info("No open orders.")
+    render_open_orders_list("admin")
 
     st.divider()
 
     # ── Danger Zone ────────────────────────────────────────────────────────────
     st.markdown("### Danger Zone")
-    st.warning("These actions are irreversible and affect live exchange positions.")
-
-    dz1, dz2 = st.columns(2)
-
-    if dz1.button("Close ALL Positions", type="secondary", use_container_width=True, key="admin_close_all_pos"):
-        _dz_ok = False
-        with st.spinner("Closing all positions…"):
-            try:
-                _dz = BitgetBroker()
-                for pos in _dz.get_open_positions():
-                    _dz.close_position(pos)
-                st.cache_data.clear()
-                _dz_ok = True
-            except Exception as exc:
-                st.error(str(exc))
-        if _dz_ok:
-            st.success("All positions closed.")
-            st.rerun()
-
-    if dz2.button("Cancel ALL Orders", type="secondary", use_container_width=True, key="admin_cancel_all_orders"):
-        _dz2_ok = False
-        with st.spinner("Cancelling all orders…"):
-            try:
-                _dz2 = BitgetBroker()
-                _dz2.cancel_all_orders()
-                st.cache_data.clear()
-                _dz2_ok = True
-            except Exception as exc:
-                st.error(str(exc))
-        if _dz2_ok:
-            st.success("All orders cancelled.")
-            st.rerun()
+    render_danger_zone("admin")
 
 
 # ─── Tab: Logs ─────────────────────────────────────────────────────────────────

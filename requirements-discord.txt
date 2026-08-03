@@ -1,0 +1,9 @@
+# Deps for the Discord control-center bot (discord_bot/). Includes the engine
+# set since the bot imports config/src modules directly.
+requests==2.32.3
+python-dotenv==1.0.1
+loguru==0.7.2
+psutil>=6.0.0
+discord.py>=2.4,<3.0
+reportlab>=4.0.0
+matplotlib>=3.8.0

@@ -139,28 +139,6 @@ class DiscordNotifier:
             ],
         })
 
-    def daily_limit_hit(self, daily_pnl_pct: float) -> None:
-        self._send({
-            "color": _ORANGE,
-            "title": "Daily Loss Limit Hit — Trading Halted",
-            "description": (
-                f"Daily drawdown reached **{daily_pnl_pct*100:.2f}%** "
-                f"(limit: {config.MAX_DAILY_LOSS_PCT*100:.1f}%).\n"
-                "No further entries will be taken today."
-            ),
-        })
-
-    def weekly_limit_hit(self, weekly_pnl_pct: float) -> None:
-        self._send({
-            "color": _RED,
-            "title": "Weekly Loss Limit Hit — Trading Halted",
-            "description": (
-                f"Weekly drawdown reached **{weekly_pnl_pct*100:.2f}%** "
-                f"(limit: {config.MAX_WEEKLY_LOSS_PCT*100:.1f}%).\n"
-                "Bot will not trade until the new week."
-            ),
-        })
-
     def signal_missed(
         self,
         session: str,

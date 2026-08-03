@@ -1,0 +1,5 @@
+# Minimal runtime deps for main.py (the trading engine) — used for the Docker
+# image so it doesn't carry dashboard/Discord-bot-only packages.
+requests==2.32.3
+python-dotenv==1.0.1
+loguru==0.7.2
