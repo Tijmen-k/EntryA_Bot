@@ -28,6 +28,9 @@ import config
 # here.
 
 _RAW = [
+    (70_000.0, 8_300.0, 16_600.0),
+    (63_000.0, 7_500.0, 15_000.0),
+    (50_000.0, 6_300.0, 12_600.0),
     (40_000.0, 5_200.0, 10_400.0),
     (32_000.0, 4_400.0,  8_800.0),
     (25_000.0, 3_700.0,  7_400.0),
@@ -58,9 +61,9 @@ class ScalingRung:
 
 _scale = config.LADDER_SCALE_FACTOR
 
-# Build ascending (Level 1 = lowest equity rung, Level 17 = highest), scaled
+# Build ascending (Level 1 = lowest equity rung, Level 20 = highest), scaled
 # by LADDER_SCALE_FACTOR. At scale=1.0 this is Level 1 = $1,000 / $300 / $600
-# ... Level 17 = $40,000 / $5,200 / $10,400, exactly as in _RAW above.
+# ... Level 20 = $70,000 / $8,300 / $16,600, exactly as in _RAW above.
 SCALING_LADDER: list[ScalingRung] = [
     ScalingRung(
         level=i + 1,
@@ -118,23 +121,27 @@ def is_boost_active(closed_trades: list[dict]) -> bool:
     """
     Boost is a state, not a per-trade check:
       - TURNS ON  when 4+ of the last 6 closed trades are wins AND the last 2 are both wins
-      - STAYS ON  until wins-in-last-6 drops below 4 (a single loss right after
-        activation does NOT turn it off, as long as the trailing 6-window still
-        has >=4 wins)
+      - TURNS OFF immediately on any loss (a loss breaks the 2-win streak that
+        justified boosting, so we drop straight back to default size)
+      - RE-ARMS   only after 2 fresh consecutive wins, provided the last-6
+        window still has >=4 wins at that point
     Replayed over the full trade history each call since we don't persist boost
     state anywhere else — cheap for the trade counts this bot sees.
     """
     boosted = False
     for i in range(len(closed_trades)):
-        window    = closed_trades[max(0, i - 5): i + 1]
-        wins_in_6 = sum(1 for t in window if (t.get("pnl_usdt") or 0) > 0)
+        trade  = closed_trades[i]
+        is_win = (trade.get("pnl_usdt") or 0) > 0
+        if boosted and not is_win:
+            boosted = False
+            continue
         if not boosted:
-            last_2 = closed_trades[max(0, i - 1): i + 1]
+            window     = closed_trades[max(0, i - 5): i + 1]
+            wins_in_6  = sum(1 for t in window if (t.get("pnl_usdt") or 0) > 0)
+            last_2     = closed_trades[max(0, i - 1): i + 1]
             last_2_win = len(last_2) == 2 and all((t.get("pnl_usdt") or 0) > 0 for t in last_2)
             if wins_in_6 >= 4 and last_2_win:
                 boosted = True
-        elif wins_in_6 < 4:
-            boosted = False
     return boosted
 
 

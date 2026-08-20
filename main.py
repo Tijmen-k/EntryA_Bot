@@ -677,6 +677,21 @@ class EntryABot:
             self._pending_entry = None
             self.state.set(pending_entry=None)
 
+    def _place_bracket_with_retry(self, place_fn, retries: int = 3, delay_s: float = 1.5, **kwargs) -> Optional[str]:
+        """Call a place_stop_market_order/place_take_profit_order-style method, retrying
+        a few times on failure before giving up. Bitget can reject a plan order for
+        transient reasons (momentary margin/price-band hiccups); a bare retry clears
+        most of those without needing a human to notice the buried error log."""
+        oid = None
+        for attempt in range(1, retries + 1):
+            oid = place_fn(**kwargs)
+            if oid:
+                return oid
+            if attempt < retries:
+                logger.warning(f"Bracket order placement failed (attempt {attempt}/{retries}), retrying...")
+                time.sleep(delay_s)
+        return oid
+
     def _activate_filled_trade(self, pe: dict, filled_pos, sm: Optional[SessionStateMachine]) -> None:
         """Limit entry has filled on the exchange — place SL/TP brackets and open the trade for real."""
         sig        = pe["signal"]
@@ -689,17 +704,65 @@ class EntryABot:
         # Sending the flipped action side (the old bug) makes Bitget label a
         # short's bracket orders as "Close Long".
         bracket_side = "sell" if direction == "short" else "buy"
+        hold_side    = "short" if direction == "short" else "long"
 
-        sl_id = self.broker.place_stop_market_order(
+        sl_id = self._place_bracket_with_retry(
+            self.broker.place_stop_market_order,
             side=bracket_side, size=contracts,
             stop_price=sig["sl_price"],
             client_id=f"sl_{sig['session']}",
         )
-        tp_id = self.broker.place_take_profit_order(
+        tp_id = self._place_bracket_with_retry(
+            self.broker.place_take_profit_order,
             side=bracket_side, size=contracts,
             limit_price=sig["tp_price"],
             client_id=f"tp_{sig['session']}",
         )
+
+        if sl_id is None or tp_id is None:
+            # A filled entry with no working SL and/or TP is a naked, unmanaged
+            # position — do not leave it open "hoping" the internal bar-based
+            # monitor will catch it later. Close it now and alert loudly instead
+            # of silently proceeding as if the trade were fully protected.
+            logger.error(
+                f"[{sig['session']}] Bracket order(s) missing after retries "
+                f"(sl_id={sl_id}, tp_id={tp_id}) — flash-closing naked position for safety"
+            )
+            if sl_id:
+                self.broker.cancel_order(sl_id)
+            if tp_id:
+                self.broker.cancel_order(tp_id)
+            try:
+                closed_ok = self.broker.flash_close(hold_side)
+            except Exception as exc:
+                closed_ok = False
+                logger.error(f"[{sig['session']}] flash_close after bracket failure raised: {exc}")
+            self.notifier.error(
+                RuntimeError(f"SL/TP placement failed for {sig['session']} {direction} entry @ {entry_price:.4f}"),
+                context=(
+                    f"entry_id={pe['entry_order_id']} sl_id={sl_id} tp_id={tp_id} — "
+                    + ("position flash-closed for safety." if closed_ok else
+                       "FLASH-CLOSE ALSO FAILED — position may still be OPEN and UNPROTECTED on "
+                       "the exchange. Check Bitget immediately.")
+                ),
+            )
+            if sm:
+                sm.pending_signal = None
+                sm.phase = SessionPhase.DONE
+            self._pending_entry = None
+            self.state.set(pending_entry=None)
+            if closed_ok:
+                journal_db.open_trade(
+                    trade_id=pe["entry_order_id"], symbol=config.SYMBOL, side=direction,
+                    entry_price=entry_price, size_btc=contracts, notional_usdt=contracts * entry_price,
+                    session=sig["session"], source="algo", leverage=config.LEVERAGE,
+                )
+                self._open_trade = OpenTrade(
+                    signal=sig, contracts=contracts, entry_order_id=pe["entry_order_id"],
+                    sl_order_id=None, tp_order_id=None,
+                )
+                self._on_trade_close("bracket_failed", entry_price, None)
+            return
 
         self._open_trade = OpenTrade(
             signal=sig,
@@ -787,6 +850,47 @@ class EntryABot:
         if sl_hit or tp_hit:
             result = "sl_hit" if sl_hit else "tp_hit"
             exit_price = sl_price if sl_hit else tp_price
+
+            # The bar crossing our level only means the bracket order SHOULD
+            # have fired — it doesn't prove it did. Confirm the position is
+            # actually gone before trusting it; otherwise a missing/failed
+            # bracket order (e.g. silently rejected by Bitget) leaves a live,
+            # unprotected position that the bot then stops tracking entirely.
+            try:
+                still_live = any(
+                    p.side == hold_side and p.symbol == config.SYMBOL
+                    for p in self.broker.get_open_positions()
+                )
+            except Exception:
+                still_live = True  # don't assume closed on an API hiccup
+
+            if still_live:
+                logger.error(
+                    f"[{sig['session']}] Bar crossed {result} level but position "
+                    f"still open on exchange — bracket order missing/failed, "
+                    f"flash-closing now for safety"
+                )
+                try:
+                    closed_ok = self.broker.flash_close(hold_side)
+                except Exception as exc:
+                    closed_ok = False
+                    logger.error(f"[{sig['session']}] Safety flash_close raised: {exc}")
+                if not closed_ok:
+                    logger.error(
+                        f"[{sig['session']}] Safety flash_close FAILED — position "
+                        f"still open and UNPROTECTED on exchange, will retry next "
+                        f"bar | error={self.broker.last_error}"
+                    )
+                    self.notifier.error(
+                        RuntimeError(f"{sig['session']} position unprotected after {result}"),
+                        context=(
+                            "Bracket order missing and the safety flash-close also "
+                            "failed — position is still open on the exchange with "
+                            "no stop. Check Bitget immediately."
+                        ),
+                    )
+                    return  # keep tracking it — do NOT mark closed until it actually is
+
             logger.info(
                 f"TRADE {result.upper()} | {sig['session']} | "
                 f"dir={direction} | entry={sig['entry_price']:.4f} | "
@@ -809,10 +913,28 @@ class EntryABot:
                     f"— closing at market | dir={direction} entry={sig['entry_price']:.4f}"
                 )
                 hold_side = "short" if direction == "short" else "long"
-                self.broker.flash_close(hold_side)
-                self._on_trade_close("time_exit", bar.close, bar)
+                try:
+                    closed_ok = self.broker.flash_close(hold_side)
+                except Exception as exc:
+                    closed_ok = False
+                    logger.error(f"[{sig['session']}] flash_close raised: {exc}")
+                if closed_ok:
+                    self._on_trade_close("time_exit", bar.close, bar)
+                else:
+                    # Do NOT mark the trade closed — the position is still open on
+                    # Bitget. Freeing the session slot here would let NY open a
+                    # second trade on top of a still-live London position. Leave
+                    # _open_trade/session phase untouched so _monitor_open_trade
+                    # retries flash_close on the next bar (and the "closed
+                    # externally" reconciliation above will catch it if the close
+                    # actually went through despite the error response).
+                    logger.error(
+                        f"[{sig['session']}] flash_close FAILED at session close — "
+                        f"position still open on exchange, will retry next bar | "
+                        f"error={self.broker.last_error}"
+                    )
 
-    def _on_trade_close(self, result: str, exit_price: float, bar: Bar) -> None:
+    def _on_trade_close(self, result: str, exit_price: float, bar: Optional[Bar]) -> None:
         sig = self._open_trade.signal
 
         # Cancel whichever bracket order(s) didn't trigger. sl_hit/tp_hit leave the
@@ -836,7 +958,8 @@ class EntryABot:
         fees_usdt: float = 0.0
         try:
             closed_data = self.broker.get_closed_position_data(
-                hold_side="short" if sig["direction"] == "short" else "long"
+                hold_side="short" if sig["direction"] == "short" else "long",
+                entry_price=sig["entry_price"],
             )
             if closed_data:
                 pnl_usdt   = closed_data["net_pnl"]

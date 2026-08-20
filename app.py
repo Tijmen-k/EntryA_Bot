@@ -323,7 +323,7 @@ def _compute_close_pnl(side, entry_price, size, notional, leverage,
     """
     try:
         broker   = broker or BitgetBroker()
-        pos_data = broker.get_closed_position_data(side)
+        pos_data = broker.get_closed_position_data(side, entry_price=entry_price)
     except Exception:
         pos_data = None
 

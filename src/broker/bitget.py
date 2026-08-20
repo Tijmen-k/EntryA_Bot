@@ -328,39 +328,62 @@ class BitgetBroker:
         for o in self.get_open_orders():
             self.cancel_order(o.order_id)
 
-    def get_closed_position_data(self, hold_side: str) -> Optional[dict]:
-        """Return the most recently closed position record for hold_side.
+    def get_closed_position_data(
+        self,
+        hold_side: str,
+        entry_price: Optional[float] = None,
+        tolerance_pct: float = 0.005,
+        retries: int = 3,
+        retry_delay_s: float = 1.5,
+    ) -> Optional[dict]:
+        """Return the closed position record for hold_side that matches this trade.
+
+        Bitget's history endpoint returns recent closes for the side regardless
+        of which trade they belong to. Without correlation, a same-direction
+        trade from an earlier session (e.g. London) can be mistaken for the
+        trade that just closed if the fresh record hasn't propagated yet —
+        silently attaching the wrong PnL/exit price to the new trade. When
+        entry_price is given, only a record whose openAvgPrice is within
+        tolerance_pct of it is accepted; a few short retries cover the case
+        where the real record simply hasn't landed yet.
 
         Returns a dict with keys: net_pnl, fees, exit_price, entry_price, size_btc
-        or None if no record found.
+        or None if no matching record is found.
         """
         params = {
             "symbol":      config.SYMBOL,
             "productType": config.PRODUCT_TYPE,
             "limit":       "5",
         }
-        resp = self._get("/position/history-position", params)
-        data = resp.get("data") or {}
-        if isinstance(data, dict):
-            positions = data.get("list") or []
-        elif isinstance(data, list):
-            positions = data
-        else:
-            positions = []
-        for pos in positions:
-            if pos.get("holdSide", "").lower() == hold_side.lower():
+        for attempt in range(1, retries + 1):
+            resp = self._get("/position/history-position", params)
+            data = resp.get("data") or {}
+            if isinstance(data, dict):
+                positions = data.get("list") or []
+            elif isinstance(data, list):
+                positions = data
+            else:
+                positions = []
+            for pos in positions:
+                if pos.get("holdSide", "").lower() != hold_side.lower():
+                    continue
                 net = pos.get("netProfit") or pos.get("pnl")
                 if net is None:
                     continue
+                open_avg = float(pos.get("openAvgPrice") or 0)
+                if entry_price and open_avg and abs(open_avg - entry_price) / entry_price > tolerance_pct:
+                    continue  # doesn't match this trade — likely a prior same-side trade
                 open_fee  = abs(float(pos.get("openFee")  or 0))
                 close_fee = abs(float(pos.get("closeFee") or 0))
                 return {
                     "net_pnl":     float(net),
                     "fees":        open_fee + close_fee,
                     "exit_price":  float(pos.get("closeAvgPrice") or 0),
-                    "entry_price": float(pos.get("openAvgPrice")  or 0),
+                    "entry_price": open_avg,
                     "size_btc":    float(pos.get("closeTotalPos") or 0),
                 }
+            if entry_price and attempt < retries:
+                time.sleep(retry_delay_s)
         return None
 
     def flash_close(self, hold_side: str) -> bool:

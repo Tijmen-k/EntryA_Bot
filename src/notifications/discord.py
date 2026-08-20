@@ -123,6 +123,11 @@ class DiscordNotifier:
             color, emoji, label = _GREEN, "✅", "TP Hit"
         elif result == "sl_hit":
             color, emoji, label = _RED, "❌", "SL Hit 🔻"
+        elif result == "bracket_failed":
+            color, emoji, label = _RED, "🚨", "Flash-Closed — SL/TP Failed"
+        elif result == "manual_close":
+            color = _GREEN if pnl_pct >= 0 else _RED
+            emoji, label = "🔧", "Closed Externally"
         else:  # time_exit — session ended before either SL or TP was reached
             color = _GREEN if pnl_pct >= 0 else _RED
             emoji, label = "⏱️", "Session Time Exit"
