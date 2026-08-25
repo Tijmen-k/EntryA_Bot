@@ -61,12 +61,11 @@ ALGO_POSITION_USDT: float = float(os.getenv("ALGO_POSITION_USDT", "300.0"))
 
 # Scales the ENTIRE position-sizing ladder (equity thresholds, default size,
 # boosted size) by this factor — set to 1.0 for the original ladder
-# (level 1 = $1,000 equity / $300 default / $600 boosted ... up to level 17
-# = $40,000 / $5,200 / $10,400). Set e.g. 0.01 to run the exact same ladder
-# shape at 1/100th scale for a small test deposit ($1,000 -> $10 equity
-# threshold, $300 -> $3 default, $600 -> $6 boosted). Change this ONE value
-# to scale the whole ladder up or down — never edit the ladder table itself
-# for this purpose.
+# (level 1 = $50 equity / $13 default / $25 boosted ... up to the top level
+# = $70,000 / $8,300 / $16,600 — see src/risk/sizing.py). Set e.g. 0.01 to
+# run the exact same ladder shape at 1/100th scale for a small test deposit.
+# Change this ONE value to scale the whole ladder up or down — never edit the
+# ladder table itself for this purpose.
 LADDER_SCALE_FACTOR: float = float(os.getenv("LADDER_SCALE_FACTOR", "1.0"))
 
 # Limit-entry buffer: how far beyond the confirming candle's close the resting

@@ -1857,7 +1857,7 @@ with tab_journal:
     Level {_pb['old_level']} → {_pb['new_level']} — Position Boost Unlocked!
   </div>
   <div style="font-size:13px; color:#2a2a2a; margin-top:6px;">
-    Default &#36;{_pb['old_position_usdt']:,.0f} → <b>&#36;{_pb['new_position_usdt']:,.0f} USDT</b>
+    Default &#36;{_pb['old_position_usdt']:,.2f} → <b>&#36;{_pb['new_position_usdt']:,.2f} USDT</b>
     &nbsp;(+{_pct_inc:.0f}%) &nbsp;·&nbsp; from trade #{_pb['trade_count'] + 1}
   </div>
 </div>
@@ -1865,11 +1865,11 @@ with tab_journal:
 
     _jm1, _jm2, _jm3, _jm4, _jm5, _jm6 = st.columns(6)
     _jm1.metric("Equity",        f"${_eq:,.2f}")
-    _jm2.metric("Position Size", f"${_pos_usdt_active:,.0f}")
+    _jm2.metric("Position Size", f"${_pos_usdt_active:,.2f}")
     _jm3.metric(f"{_BASE_CCY} Size",  f"{_pos_btc:.4f}")
     _jm4.metric("Wins / Last 6", f"{_streak['wins_in_last_6']} / {_streak['trades_in_last_6']}")
     _jm5.metric("2x Win Streak", "Yes" if _streak["last_2_wins"] else "No")
-    _jm6.metric("Next Level At", f"${_nxt.min_equity:,.0f}" if _nxt else "MAX")
+    _jm6.metric("Next Level At", f"${_nxt.min_equity:,.2f}" if _nxt else "MAX")
 
     st.divider()
 
@@ -1888,9 +1888,9 @@ with tab_journal:
             _rows.append(
                 f"<tr style='{_bg}{_col}'>"
                 f"<td style='padding:3px 8px;'>Lv {_r.level}</td>"
-                f"<td style='padding:3px 8px;'>${_r.min_equity:,.0f}</td>"
-                f"<td style='padding:3px 8px;'>${_r.default_usdt:,.0f}</td>"
-                f"<td style='padding:3px 8px;color:#E67E22;'>${_r.boosted_usdt:,.0f}</td>"
+                f"<td style='padding:3px 8px;'>${_r.min_equity:,.2f}</td>"
+                f"<td style='padding:3px 8px;'>${_r.default_usdt:,.2f}</td>"
+                f"<td style='padding:3px 8px;color:#E67E22;'>${_r.boosted_usdt:,.2f}</td>"
                 f"<td style='padding:3px 6px;font-size:11px;color:#888;'>{_tag}</td>"
                 f"</tr>"
             )
@@ -1922,9 +1922,9 @@ with tab_journal:
                 "old_position_usdt": "Old ($)", "new_position_usdt": "New ($)",
                 "equity": "Equity", "pct_inc": "Delta",
             })
-            _bdf["Old ($)"] = _bdf["Old ($)"].map("${:,.0f}".format)
-            _bdf["New ($)"] = _bdf["New ($)"].map("${:,.0f}".format)
-            _bdf["Equity"]  = _bdf["Equity"].map("${:,.0f}".format)
+            _bdf["Old ($)"] = _bdf["Old ($)"].map("${:,.2f}".format)
+            _bdf["New ($)"] = _bdf["New ($)"].map("${:,.2f}".format)
+            _bdf["Equity"]  = _bdf["Equity"].map("${:,.2f}".format)
             st.dataframe(
                 _bdf[["Date","Trade #","From Lv","To Lv","Old ($)","New ($)","Equity","Delta"]],
                 use_container_width=True, hide_index=True,

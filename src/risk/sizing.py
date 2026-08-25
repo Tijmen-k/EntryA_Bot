@@ -48,6 +48,16 @@ _RAW = [
     ( 1_600.0,   430.0,    860.0),
     ( 1_250.0,   360.0,    720.0),
     ( 1_000.0,   300.0,    600.0),
+    #   ↓ sub-$1,000 rungs so the bot always has a valid (smaller) rung
+    #   instead of stalling on "insufficient funds" once equity drops below
+    #   the old $1,000 floor.
+    (   600.0,   250.0,    500.0),
+    (   450.0,   200.0,    400.0),
+    (   350.0,   150.0,    300.0),
+    (   250.0,   100.0,    200.0),
+    (   150.0,    50.0,    100.0),
+    (   100.0,    25.0,     50.0),
+    (    50.0,    13.0,     25.0),
 ]
 
 
@@ -61,9 +71,10 @@ class ScalingRung:
 
 _scale = config.LADDER_SCALE_FACTOR
 
-# Build ascending (Level 1 = lowest equity rung, Level 20 = highest), scaled
-# by LADDER_SCALE_FACTOR. At scale=1.0 this is Level 1 = $1,000 / $300 / $600
-# ... Level 20 = $70,000 / $8,300 / $16,600, exactly as in _RAW above.
+# Build ascending (Level 1 = lowest equity rung, highest level = highest
+# equity), scaled by LADDER_SCALE_FACTOR. At scale=1.0 this is Level 1 = $50 /
+# $13 / $25 ... top level = $70,000 / $8,300 / $16,600, exactly as in _RAW
+# above.
 SCALING_LADDER: list[ScalingRung] = [
     ScalingRung(
         level=i + 1,
